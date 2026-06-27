@@ -92,17 +92,43 @@ class Panel:
     def __init__(self, kok):
         self.kok = kok
         kok.title("Google Bot  •  Yönetim Paneli")
-        kok.geometry("1180x820")
-        kok.minsize(1000, 720)
+        # Ekrana SIĞACAK şekilde boyutla (küçük ekranda taşmasın, her şey erişilebilir).
+        sw, sh = kok.winfo_screenwidth(), kok.winfo_screenheight()
+        w, h = min(1180, sw - 40), min(820, sh - 80)
+        x, y = max(0, (sw - w) // 2), max(0, (sh - h) // 3)
+        kok.geometry(f"{w}x{h}+{x}+{y}")
+        kok.minsize(min(820, sw - 40), min(540, sh - 80))
         kok.configure(bg=BG)
 
         self.calisiyor = False
         self.dur_bayrak = False
 
         self._stil()
+
+        # --- Kaydırılabilir kapsayıcı: içerik ekrandan büyükse dikey scroll çıkar ---
+        disk = tk.Frame(kok, bg=BG)
+        disk.pack(fill="both", expand=True)
+        self._canvas = tk.Canvas(disk, bg=BG, highlightthickness=0)
+        vsb = ttk.Scrollbar(disk, orient="vertical", command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self._canvas.pack(side="left", fill="both", expand=True)
+
+        # Tüm panel içeriği bu iç çerçeveye girer
+        self.icerik = tk.Frame(self._canvas, bg=BG)
+        self._ic_win = self._canvas.create_window((0, 0), window=self.icerik, anchor="nw")
+        self.icerik.bind(
+            "<Configure>",
+            lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
+        self._canvas.bind(
+            "<Configure>",
+            lambda e: self._canvas.itemconfigure(self._ic_win, width=e.width))
+        # Fare tekeriyle kaydır (imleç panel üzerindeyken)
+        self._canvas.bind_all("<MouseWheel>", self._tekerle_kaydir)
+
         self._header()
 
-        govde = tk.Frame(kok, bg=BG)
+        govde = tk.Frame(self.icerik, bg=BG)
         govde.pack(fill="both", expand=True, padx=16, pady=(0, 8))
 
         self._sol_tablo(govde)
@@ -111,6 +137,13 @@ class Panel:
 
         self._tabloyu_doldur(yukle())
         kok.protocol("WM_DELETE_WINDOW", self.kapat)
+
+    def _tekerle_kaydir(self, e):
+        """Fare tekeri ile dikey kaydırma."""
+        try:
+            self._canvas.yview_scroll(int(-e.delta / 120), "units")
+        except Exception:
+            pass
 
     # ---------- stil ----------
     def _stil(self):
@@ -147,7 +180,7 @@ class Panel:
 
     # ---------- header ----------
     def _header(self):
-        h = tk.Frame(self.kok, bg=BG)
+        h = tk.Frame(self.icerik, bg=BG)
         h.pack(fill="x", padx=16, pady=(14, 10))
         nokta = tk.Canvas(h, width=14, height=14, bg=BG, highlightthickness=0)
         nokta.create_oval(2, 2, 12, 12, fill=ACCENT, outline="")
@@ -283,6 +316,8 @@ class Panel:
         self._ayar_check(ic, "Sadece reklam (Ad) linkleri", self.sadece_reklam)
         self.headless = tk.BooleanVar(value=False)
         self._ayar_check(ic, "Görünmez mod (headless)", self.headless)
+        self.mobil = tk.BooleanVar(value=False)
+        self._ayar_check(ic, "Mobil ekran (telefon görünümü)", self.mobil)
         self.detach = tk.BooleanVar(value=False)
         self._ayar_check(ic, "Tarayıcı açık kalsın", self.detach)
         self.sadece_secili = tk.BooleanVar(value=False)
@@ -340,7 +375,7 @@ class Panel:
 
     # ---------- konsol ----------
     def _konsol(self):
-        dis = tk.Frame(self.kok, bg="#0b1120", highlightbackground=KENAR,
+        dis = tk.Frame(self.icerik, bg="#0b1120", highlightbackground=KENAR,
                        highlightthickness=1)
         dis.pack(fill="both", expand=False, padx=16, pady=(0, 14))
         ust = tk.Frame(dis, bg="#0b1120")
@@ -517,6 +552,7 @@ class Panel:
         detach = self.detach.get()
         headless = self.headless.get()
         reklam = self.sadece_reklam.get()
+        mobil = self.mobil.get()
         tur = 0
         try:
             while not self.dur_bayrak:
@@ -539,7 +575,7 @@ class Panel:
                             sadece_reklam=reklam,
                             log_cb=self.yaz,
                             dur_kontrol=lambda: self.dur_bayrak,
-                            yeni_site_cb=lambda d, _a=x["arama"]: self._reklam_domain_ekle(_a, d),
+                            mobil=mobil,
                         )
                     except Exception as ex:
                         self.yaz(f"HATA ({x['arama']}): {ex}", "hata")
@@ -554,31 +590,6 @@ class Panel:
         finally:
             self.yaz("✓ Durduruldu." if self.dur_bayrak else "✓ Tamamlandı.", "ok")
             self.kok.after(0, self._bitti)
-
-    def _reklam_domain_ekle(self, arama, domain):
-        """SERP'te bulunan yeni reklam domainini ilgili aramanın hedef listesine ekle + kaydet.
-
-        google_bot iş parçacığından çağrılır -> UI güncellemesi after() ile ana thread'de.
-        """
-        domain = (domain or "").strip().lower()
-        if not domain:
-            return
-
-        def _ekle():
-            for iid in self.tablo.get_children():
-                a, s, t = self.tablo.item(iid, "values")
-                if a != arama:
-                    continue
-                mevcut = [d.strip().lower() for d in s.split(",") if d.strip()]
-                if domain in mevcut:
-                    return
-                yeni = (s.strip() + ", " + domain) if s.strip() else domain
-                self.tablo.item(iid, values=(a, yeni, t))
-                self._kaydet()
-                self.yaz(f"  + yeni reklam listeye eklendi: {domain}", "ok")
-                return
-
-        self.kok.after(0, _ekle)
 
     def cihaz_yenile(self):
         """ADB cihazlarını tara, combobox'ı doldur."""

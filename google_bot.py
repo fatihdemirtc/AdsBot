@@ -375,13 +375,15 @@ def cerez_kapat(driver):
         "//button[contains(., 'Kabul et')]",
         "//div[@role='none']//button[2]",
     ]
-    for xp in xpaths:
+    # Çerez penceresi genelde hiç çıkmaz (ncr) -> uzun beklememek için kısa timeout.
+    # İlk xpath'te 1.2 sn dene; çıkmadıysa kalanları anında (0 bekleme) kontrol et.
+    for i, xp in enumerate(xpaths):
         try:
-            btn = WebDriverWait(driver, 3).until(
+            btn = WebDriverWait(driver, 1.2 if i == 0 else 0).until(
                 EC.element_to_be_clickable((By.XPATH, xp))
             )
             btn.click()
-            insanca_bekle()
+            insanca_bekle(0.3, 0.7)
             return True
         except Exception:
             continue
@@ -403,6 +405,60 @@ def _temiz_domain(domain):
             .replace("www.", "").strip("/"))
 
 
+def _href_host(href):
+    """href'in gerçek HEDEF host'unu çıkar (yol/sorgu değil).
+
+    Google yönlendirmesi (/url?q=) ve reklam (/aclk?...&adurl=) ise asıl hedefi
+    q/adurl/url parametresinden alır. Döner: temiz host (www'siz) ya da "".
+    """
+    import urllib.parse as up
+    try:
+        p = up.urlparse(href or "")
+        host = p.netloc
+        yol = (p.path or "")
+        # yönlendirme: gerçek hedef parametrede
+        if (not host) or ("google." in host) or "/aclk" in yol or yol == "/url" or "/pagead/" in yol:
+            par = up.parse_qs(p.query)
+            for anahtar in ("adurl", "url", "q", "u"):
+                if par.get(anahtar):
+                    host = up.urlparse(par[anahtar][0]).netloc or host
+                    break
+        return _temiz_domain(host)
+    except Exception:
+        return ""
+
+
+def _host_es(href, domain):
+    """href'in HOST'u domain ile eşleşiyor mu? SADECE alan adı; tam URL değil.
+
+    Eşleşme: host == domain  ya da  host, '.'+domain ile biter (alt alan adı).
+    """
+    domain = _temiz_domain(domain)
+    if not domain:
+        return False
+    host = _href_host(href)
+    if not host:
+        return False
+    return host == domain or host.endswith("." + domain)
+
+
+def _gorunur_hostlar(driver, limit=15):
+    """Organik sonuçların host listesini döndür (teşhis/log için)."""
+    hostlar = []
+    try:
+        for h3 in driver.find_elements(By.CSS_SELECTOR, "a h3"):
+            try:
+                a = h3.find_element(By.XPATH, "./ancestor::a[1]")
+                h = _href_host(a.get_attribute("href") or "")
+                if h and h not in hostlar:
+                    hostlar.append(h)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return hostlar[:limit]
+
+
 def _hedef_link_bul(driver, domain):
     """
     Sonuçlarda href'i domain içeren görünür linki döndür (yoksa None).
@@ -414,8 +470,7 @@ def _hedef_link_bul(driver, domain):
 
     def _eslesir(a):
         try:
-            href = (a.get_attribute("href") or "").lower()
-            return domain in href and a.is_displayed()
+            return a.is_displayed() and _host_es(a.get_attribute("href") or "", domain)
         except Exception:
             return False
 
@@ -520,13 +575,13 @@ def _icinde_reklam_konteyner(a):
 
 
 def _reklam_link_bul(driver, domain):
-    """Reklamlar arasında href'i domain içeren ilk görünür linki döndür."""
+    """Reklamlar arasında HOST'u domain ile eşleşen ilk görünür linki döndür (tam URL değil)."""
     domain = _temiz_domain(domain)
     if not domain:
         return None
     for a in _reklam_linkleri(driver):
         try:
-            if domain in (a.get_attribute("href") or "").lower():
+            if _host_es(a.get_attribute("href") or "", domain):
                 return a
         except Exception:
             continue
@@ -652,12 +707,8 @@ def _yanlis_tikla_don(driver, serp_url, log_cb, kacin=None):
         pass
 
 
-def _reklam_domainleri_topla(driver, log_cb, bilinen, yeni_site_cb):
-    """SERP'teki TÜM reklam domainlerini çıkar; 'bilinen' sette olmayan YENİLERİ bildir.
-
-    bilinen      : zaten listede olan temiz domainler (set, yerinde güncellenir)
-    yeni_site_cb : fn(domain) -> yeni bulunan reklam domainini listeye ekler
-    """
+def _reklam_domainleri_topla(driver, log_cb):
+    """SERP'teki TÜM reklam domainlerini çıkar ve LOGLA (listeye ekleme YOK)."""
     bulunan = []
     try:
         for a in _reklam_linkleri(driver):
@@ -665,17 +716,8 @@ def _reklam_domainleri_topla(driver, log_cb, bilinen, yeni_site_cb):
                 rd = _temiz_domain(_reklam_domain(a.get_attribute("href") or ""))
             except Exception:
                 rd = ""
-            if not rd or rd in bulunan:
-                continue
-            bulunan.append(rd)
-            if rd not in bilinen:
-                bilinen.add(rd)
-                _log(log_cb, f"  + SERP'te yeni reklam domaini: {rd}")
-                if yeni_site_cb:
-                    try:
-                        yeni_site_cb(rd)
-                    except Exception:
-                        pass
+            if rd and rd not in bulunan:
+                bulunan.append(rd)
     except Exception:
         pass
     if bulunan:
@@ -685,8 +727,19 @@ def _reklam_domainleri_topla(driver, log_cb, bilinen, yeni_site_cb):
     return bulunan
 
 
+def _mobil_emulasyon():
+    """Chrome mobil cihaz emülasyonu sözlüğü (Pixel 7 benzeri, mobil UA)."""
+    major = _chrome_major() or 124
+    ua = (f"Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+          f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Mobile Safari/537.36")
+    return {
+        "deviceMetrics": {"width": 412, "height": 915, "pixelRatio": 2.625, "mobile": True},
+        "userAgent": ua,
+    }
+
+
 def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
-            sadece_reklam=False, log_cb=None, dur_kontrol=None, yeni_site_cb=None):
+            sadece_reklam=False, log_cb=None, dur_kontrol=None, mobil=False):
     """
     Tek bir arama çalıştır.
       arama         : aranacak kelime (str)
@@ -698,7 +751,7 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
       sadece_reklam : True ise SADECE reklam (Ad/Sponsorlu) linklerine tıklar
       log_cb        : log mesajı için callback fn(str)
       dur_kontrol   : iptal için fn() -> True dönerse durur
-      yeni_site_cb  : SERP'te bulunan YENİ reklam domaini için fn(domain) -> listeye ekler
+      mobil         : True ise Chrome'u telefon emülasyonunda açar (dar viewport + mobil UA)
     """
 
     def iptal_mi():
@@ -715,7 +768,9 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
         # NOT: --no-sandbox KALDIRILDI. Gerçek kullanıcıda yoktur -> bot sinyali.
         # Eğer çökerse (root/Docker/eski sistem) geri ekle.
         op.add_argument("--disable-dev-shm-usage")
-        if gorunmez:
+        if mobil:
+            op.add_argument("--window-size=412,915")
+        elif gorunmez:
             op.add_argument("--window-size=1920,1080")
 
     driver = None
@@ -726,16 +781,26 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
         try:
             op = uc.ChromeOptions()
             op.add_argument("--lang=tr-TR")
-            if gorunmez:
+            if mobil:
+                op.add_experimental_option("mobileEmulation", _mobil_emulasyon())
+                op.add_argument("--window-size=412,915")
+            elif gorunmez:
                 op.add_argument("--window-size=1920,1080")
             major = _chrome_major()
-            _log(log_cb, f"Chrome (uc) açılıyor... (sürüm {major}) arama: '{arama}'")
+            _log(log_cb, f"Chrome (uc) açılıyor... (sürüm {major}"
+                         f"{', mobil' if mobil else ''}) arama: '{arama}'")
             driver = uc.Chrome(options=op, headless=gorunmez,
                                use_subprocess=True, version_main=major)
-            try:
-                driver.maximize_window()
-            except Exception:
-                pass
+            if mobil:
+                try:
+                    driver.set_window_size(412, 915)
+                except Exception:
+                    pass
+            else:
+                try:
+                    driver.maximize_window()
+                except Exception:
+                    pass
         except Exception as ex:
             _log(log_cb, f"uc başarısız ({str(ex)[:80]}), düz Selenium'a geçiliyor.")
             driver = None
@@ -743,7 +808,8 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
     if driver is None:
         # Yedek: düz Selenium
         op = webdriver.ChromeOptions()
-        op.add_argument("--start-maximized")
+        if not mobil:
+            op.add_argument("--start-maximized")
         op.add_argument("--disable-blink-features=AutomationControlled")
         # Botu ele veren switch'leri kapat:
         #  - enable-automation: "otomatik yazılım kontrol ediyor" çubuğu + webdriver=true
@@ -751,6 +817,8 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
         op.add_experimental_option("excludeSwitches", ["enable-automation"])
         op.add_experimental_option("useAutomationExtension", False)
         op.add_argument("--disable-infobars")
+        if mobil:
+            op.add_experimental_option("mobileEmulation", _mobil_emulasyon())
         _ortak_arg(op)
         op.add_argument("--disable-gpu")
         op.add_argument("--remote-debugging-port=0")
@@ -764,7 +832,8 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
 
     try:
         driver.get("https://www.google.com/ncr")
-        insanca_bekle()
+        # sayfa yükü sonrası KISA sabit bekleme (insanca_bekle'nin uzun kuyruğu yok)
+        time.sleep(random.uniform(0.3, 0.7))
         cerez_kapat(driver)
         if iptal_mi():
             return
@@ -773,9 +842,9 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
             EC.presence_of_element_located((By.NAME, "q"))
         )
         kutu.click()
-        insanca_bekle(0.3, 0.8)
+        time.sleep(random.uniform(0.2, 0.5))
         _insanca_yaz(kutu, arama)
-        insanca_bekle()
+        time.sleep(random.uniform(0.25, 0.6))   # yazım sonrası kısa, sonra ara
         kutu.send_keys(Keys.RETURN)
         _log(log_cb, "Arama yapıldı, sonuçlar bekleniyor...")
 
@@ -825,18 +894,6 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
                     pass
             _log(log_cb, f"  {len(rek)} reklam linki bulundu. "
                          f"Reklam siteleri: {', '.join(sorted(set(d for d in rek_domainler if d))) or '-'}")
-            # listede olmayan yeni reklam domainlerini ekle
-            bilinen = set(_temiz_domain(d) for d in domainler)
-            for rd in rek_domainler:
-                rd = _temiz_domain(rd or "")
-                if rd and rd not in bilinen:
-                    bilinen.add(rd)
-                    _log(log_cb, f"  + SERP'te yeni reklam domaini: {rd}")
-                    if yeni_site_cb:
-                        try:
-                            yeni_site_cb(rd)
-                        except Exception:
-                            pass
             if domainler:
                 # listemizdeki domainlerden reklam olarak çıkanları SIRAYLA tıkla
                 temiz_liste = [_temiz_domain(d) for d in domainler]
@@ -874,9 +931,11 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
             # Her domaini SERP'te taze bul, tıkla, gez, SERP'e dön, sıradakine geç.
             mouse_gezin(driver, dongu=1)
             _tum_sayfayi_kaydir(driver)   # tüm sonuç + alt reklamlar yüklensin
-            # SERP'teki reklam domainlerini topla; listede olmayan YENİLERİ ekle
-            bilinen = set(_temiz_domain(d) for d in domainler)
-            _reklam_domainleri_topla(driver, log_cb, bilinen, yeni_site_cb)
+            # SERP'teki reklam domainlerini sadece logla (listeye ekleme yok)
+            _reklam_domainleri_topla(driver, log_cb)
+            # teşhis: sayfadaki organik host'lar (hedef tutmazsa neden görülür)
+            _log(log_cb, f"  Organik sonuç host'ları: "
+                         f"{', '.join(_gorunur_hostlar(driver)) or '-'}")
             # insan gibi: %25 ihtimalle önce ilgisiz bir sonuca tıkla-dön
             if not iptal_mi() and random.random() < 0.25:
                 _yanlis_tikla_don(driver, serp_url, log_cb, kacin=domainler)
