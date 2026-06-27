@@ -1,0 +1,22 @@
+# Build çıktıları
+build/
+dist/
+*.spec.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Çalışma verisi (müşteri hedef domainleri - gizli)
+aramalar.json
+
+# Hata / log
+hata.png
+hata_log.txt
+*.log
+
+# Selenium / uc profilleri
+selenium_chrome_*/
