@@ -539,6 +539,7 @@ class Panel:
                             sadece_reklam=reklam,
                             log_cb=self.yaz,
                             dur_kontrol=lambda: self.dur_bayrak,
+                            yeni_site_cb=lambda d, _a=x["arama"]: self._reklam_domain_ekle(_a, d),
                         )
                     except Exception as ex:
                         self.yaz(f"HATA ({x['arama']}): {ex}", "hata")
@@ -553,6 +554,31 @@ class Panel:
         finally:
             self.yaz("✓ Durduruldu." if self.dur_bayrak else "✓ Tamamlandı.", "ok")
             self.kok.after(0, self._bitti)
+
+    def _reklam_domain_ekle(self, arama, domain):
+        """SERP'te bulunan yeni reklam domainini ilgili aramanın hedef listesine ekle + kaydet.
+
+        google_bot iş parçacığından çağrılır -> UI güncellemesi after() ile ana thread'de.
+        """
+        domain = (domain or "").strip().lower()
+        if not domain:
+            return
+
+        def _ekle():
+            for iid in self.tablo.get_children():
+                a, s, t = self.tablo.item(iid, "values")
+                if a != arama:
+                    continue
+                mevcut = [d.strip().lower() for d in s.split(",") if d.strip()]
+                if domain in mevcut:
+                    return
+                yeni = (s.strip() + ", " + domain) if s.strip() else domain
+                self.tablo.item(iid, values=(a, yeni, t))
+                self._kaydet()
+                self.yaz(f"  + yeni reklam listeye eklendi: {domain}", "ok")
+                return
+
+        self.kok.after(0, _ekle)
 
     def cihaz_yenile(self):
         """ADB cihazlarını tara, combobox'ı doldur."""

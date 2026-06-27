@@ -289,28 +289,35 @@ def mouse_gezin(driver, dongu=3):
         insanca_bekle(0.5, 1.2)
 
 
-def _tum_sayfayi_kaydir(driver, max_adim=14):
+def _tum_sayfayi_kaydir(driver, max_adim=30):
     """Sayfayı parça parça EN ALTA kadar indir (lazy sonuç + alt reklamlar yüklensin), sonra başa dön.
 
     Aşağıdaki organik sonuçlar ve #bottomads reklamları ancak scroll'la DOM'a gelir.
-    Bu yapılmazsa hedef domain sayfada 'görünür' ama bot bulamaz/tıklayamaz.
+    NOT: 'behavior:smooth' KULLANILMAZ — animasyon bitmeden scrollY okununca
+    erken 'dibe vardı' sanılıp duruyordu. Anlık scrollBy + bekleme ile ölç.
     """
     try:
         son_y = -1
+        durgun = 0
         for _ in range(max_adim):
-            driver.execute_script(
-                f"window.scrollBy({{top: {random.randint(450, 850)}, behavior:'smooth'}});")
-            insanca_bekle(0.4, 0.9)
-            y = driver.execute_script("return window.scrollY + window.innerHeight;")
+            driver.execute_script("window.scrollBy(0, arguments[0]);",
+                                  random.randint(350, 650))
+            insanca_bekle(0.35, 0.8)   # lazy içerik yüklensin
+            y = driver.execute_script(
+                "return Math.round(window.scrollY + window.innerHeight);")
             toplam = driver.execute_script("return document.body.scrollHeight;")
-            if y >= toplam - 5:       # dibe vardı
+            if y >= toplam - 4:        # gerçekten dibe vardı
                 break
-            if abs(y - son_y) < 5:    # daha inmiyor
-                break
+            if abs(y - son_y) < 4:     # konum değişmiyor (büyümüyor)
+                durgun += 1
+                if durgun >= 2:        # üst üste 2 kez takıldıysa bitir
+                    break
+            else:
+                durgun = 0
             son_y = y
-        insanca_bekle(0.5, 1.0)
-        driver.execute_script("window.scrollTo({top: 0, behavior:'smooth'});")
-        insanca_bekle(0.6, 1.2)
+        insanca_bekle(0.4, 0.9)
+        driver.execute_script("window.scrollTo(0, 0);")   # başa anlık dön
+        insanca_bekle(0.6, 1.1)
     except Exception:
         pass
 
@@ -450,42 +457,53 @@ def _reklam_mi(href):
 
 
 def _reklam_linkleri(driver):
+    """Sayfadaki TÜM reklam linklerini döndür (görünür, tekrarsız).
+
+    Tespit JS ile yapılır -> Google'ın sık değişen reklam DOM'una dayanıklı:
+      - reklam konteyneri içinde mi (#tads/#tadsb/#bottomads/#taw, data-text-ad/pcu/rw, aria-label)
+      - 'Sponsorlu/Sponsored/Reklam' etiketi yakınında mı
+      - href reklam izi taşıyor mu (aclk/adservices/pagead/adurl)
     """
-    Sayfadaki TÜM reklam linklerini döndür (sırayla, tekrarsız).
-    Hem reklam konteynerleri hem de href'i aclk/adservices olan linkler.
+    js = r"""
+    const out = [], seen = new Set();
+    const ID_AD = ['tads','tadsb','bottomads','taw'];
+    const reklamKonteyner = (el) => {
+      let p = el;
+      for (let i = 0; i < 7 && p; i++, p = p.parentElement) {
+        if (p.id && ID_AD.includes(p.id)) return true;
+        if (p.hasAttribute && (p.hasAttribute('data-text-ad') ||
+            p.hasAttribute('data-pcu') || p.hasAttribute('data-rw'))) return true;
+        const al = (p.getAttribute && (p.getAttribute('aria-label') || '')) || '';
+        if (/reklam|^ads$/i.test(al)) return true;
+      }
+      return false;
+    };
+    const sponEtiket = (el) => {
+      let p = el;
+      for (let i = 0; i < 5 && p; i++, p = p.parentElement) {
+        const t = ((p.innerText || '').slice(0, 40)).toLowerCase();
+        if (/^sponsorlu|^sponsored|^reklam\b|·\s*sponsorlu|·\s*sponsored/.test(t)) return true;
+      }
+      return false;
+    };
+    const hrefAd = (h) => /\/aclk|googleadservices|googlesyndication|\/pagead\/|adurl=/.test((h||'').toLowerCase());
+    document.querySelectorAll('a[href]').forEach(a => {
+      const href = a.href || '';
+      if (!href || seen.has(href)) return;
+      if (hrefAd(href) || reklamKonteyner(a) || sponEtiket(a)) {
+        const r = a.getBoundingClientRect();
+        if (a.offsetParent !== null || r.width > 0 || r.height > 0) {
+          seen.add(href);
+          out.push(a);
+        }
+      }
+    });
+    return out;
     """
-    out, gorulen = [], set()
-    aday = []
     try:
-        aday += driver.find_elements(By.CSS_SELECTOR, REKLAM_SECICILER)
+        return driver.execute_script(js) or []
     except Exception:
-        pass
-    try:
-        aday += driver.find_elements(By.CSS_SELECTOR, "a[href]")
-    except Exception:
-        pass
-    for a in aday:
-        try:
-            href = a.get_attribute("href") or ""
-            if not href or not a.is_displayed():
-                continue
-            # konteynerden gelmediyse href izine bak
-            if href in gorulen:
-                continue
-            gorulen.add(href)
-            out.append(a)
-        except Exception:
-            continue
-    # Sadece gerçek reklam olanları süz (konteyner + href izi birleşik)
-    rek = []
-    for a in out:
-        try:
-            href = a.get_attribute("href") or ""
-            if _reklam_mi(href) or _icinde_reklam_konteyner(a):
-                rek.append(a)
-        except Exception:
-            continue
-    return rek
+        return []
 
 
 def _icinde_reklam_konteyner(a):
@@ -634,8 +652,41 @@ def _yanlis_tikla_don(driver, serp_url, log_cb, kacin=None):
         pass
 
 
+def _reklam_domainleri_topla(driver, log_cb, bilinen, yeni_site_cb):
+    """SERP'teki TÜM reklam domainlerini çıkar; 'bilinen' sette olmayan YENİLERİ bildir.
+
+    bilinen      : zaten listede olan temiz domainler (set, yerinde güncellenir)
+    yeni_site_cb : fn(domain) -> yeni bulunan reklam domainini listeye ekler
+    """
+    bulunan = []
+    try:
+        for a in _reklam_linkleri(driver):
+            try:
+                rd = _temiz_domain(_reklam_domain(a.get_attribute("href") or ""))
+            except Exception:
+                rd = ""
+            if not rd or rd in bulunan:
+                continue
+            bulunan.append(rd)
+            if rd not in bilinen:
+                bilinen.add(rd)
+                _log(log_cb, f"  + SERP'te yeni reklam domaini: {rd}")
+                if yeni_site_cb:
+                    try:
+                        yeni_site_cb(rd)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    if bulunan:
+        _log(log_cb, f"  Reklam domainleri ({len(bulunan)}): {', '.join(bulunan)}")
+    else:
+        _log(log_cb, "  Sayfada reklam linki bulunamadı.")
+    return bulunan
+
+
 def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
-            sadece_reklam=False, log_cb=None, dur_kontrol=None):
+            sadece_reklam=False, log_cb=None, dur_kontrol=None, yeni_site_cb=None):
     """
     Tek bir arama çalıştır.
       arama         : aranacak kelime (str)
@@ -647,6 +698,7 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
       sadece_reklam : True ise SADECE reklam (Ad/Sponsorlu) linklerine tıklar
       log_cb        : log mesajı için callback fn(str)
       dur_kontrol   : iptal için fn() -> True dönerse durur
+      yeni_site_cb  : SERP'te bulunan YENİ reklam domaini için fn(domain) -> listeye ekler
     """
 
     def iptal_mi():
@@ -762,7 +814,8 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
 
         if sadece_reklam:
             # --- SADECE reklam (Ad/Sponsorlu) linklerini iyice tara ---
-            mouse_gezin(driver, dongu=1)   # ad'lerin yüklenmesi için biraz gez
+            mouse_gezin(driver, dongu=1)
+            _tum_sayfayi_kaydir(driver)    # üst+alt tüm reklamlar yüklensin
             rek = _reklam_linkleri(driver)
             rek_domainler = []
             for a in rek:
@@ -772,6 +825,18 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
                     pass
             _log(log_cb, f"  {len(rek)} reklam linki bulundu. "
                          f"Reklam siteleri: {', '.join(sorted(set(d for d in rek_domainler if d))) or '-'}")
+            # listede olmayan yeni reklam domainlerini ekle
+            bilinen = set(_temiz_domain(d) for d in domainler)
+            for rd in rek_domainler:
+                rd = _temiz_domain(rd or "")
+                if rd and rd not in bilinen:
+                    bilinen.add(rd)
+                    _log(log_cb, f"  + SERP'te yeni reklam domaini: {rd}")
+                    if yeni_site_cb:
+                        try:
+                            yeni_site_cb(rd)
+                        except Exception:
+                            pass
             if domainler:
                 # listemizdeki domainlerden reklam olarak çıkanları SIRAYLA tıkla
                 temiz_liste = [_temiz_domain(d) for d in domainler]
@@ -809,6 +874,9 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
             # Her domaini SERP'te taze bul, tıkla, gez, SERP'e dön, sıradakine geç.
             mouse_gezin(driver, dongu=1)
             _tum_sayfayi_kaydir(driver)   # tüm sonuç + alt reklamlar yüklensin
+            # SERP'teki reklam domainlerini topla; listede olmayan YENİLERİ ekle
+            bilinen = set(_temiz_domain(d) for d in domainler)
+            _reklam_domainleri_topla(driver, log_cb, bilinen, yeni_site_cb)
             # insan gibi: %25 ihtimalle önce ilgisiz bir sonuca tıkla-dön
             if not iptal_mi() and random.random() < 0.25:
                 _yanlis_tikla_don(driver, serp_url, log_cb, kacin=domainler)
