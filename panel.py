@@ -318,6 +318,8 @@ class Panel:
         self._ayar_check(ic, "Görünmez mod (headless)", self.headless)
         self.mobil = tk.BooleanVar(value=False)
         self._ayar_check(ic, "Mobil ekran (telefon görünümü)", self.mobil)
+        self.gercek_telefon = tk.BooleanVar(value=False)
+        self._ayar_check(ic, "Gerçek telefon (ADB Android Chrome)", self.gercek_telefon)
         self.detach = tk.BooleanVar(value=False)
         self._ayar_check(ic, "Tarayıcı açık kalsın", self.detach)
         self.sadece_secili = tk.BooleanVar(value=False)
@@ -553,6 +555,8 @@ class Panel:
         headless = self.headless.get()
         reklam = self.sadece_reklam.get()
         mobil = self.mobil.get()
+        gercek_telefon = self.gercek_telefon.get()
+        cihaz_seri = self._secili_seri()
         tur = 0
         try:
             while not self.dur_bayrak:
@@ -576,6 +580,8 @@ class Panel:
                             log_cb=self.yaz,
                             dur_kontrol=lambda: self.dur_bayrak,
                             mobil=mobil,
+                            gercek_telefon=gercek_telefon,
+                            cihaz_seri=cihaz_seri,
                         )
                     except Exception as ex:
                         self.yaz(f"HATA ({x['arama']}): {ex}", "hata")
@@ -622,7 +628,8 @@ class Panel:
         seri = self._secili_seri()
         self.yaz(f"Uçak modu AÇ, 15 sn bekle, KAPA... (cihaz: {seri or 'otomatik'})")
         try:
-            google_bot.ucak_modu_yenile(seri=seri, bekle=15, log_cb=self.yaz)
+            google_bot.ucak_modu_yenile(seri=seri, bekle=15, geri_bekle=12,
+                                        log_cb=self.yaz)
         except Exception as ex:
             self.yaz(f"Uçak modu HATA: {ex}", "hata")
         # IP değişti mi göster

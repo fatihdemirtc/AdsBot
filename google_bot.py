@@ -390,6 +390,45 @@ def cerez_kapat(driver):
     return False
 
 
+def konum_popup_kapat(driver):
+    """Google 'konumunuzu kullanmak istiyor' / izin penceresini REDDEDEREK kapat.
+
+    Özellikle mobilde çıkar ve sayfayı bloklar -> hedeflere tıklamayı engeller.
+    Negatif (reddet/daha sonra) butonu hangi metinle çıkarsa tıkla.
+    """
+    metinler = [
+        "Hayır teşekkürler", "Daha sonra", "Şimdi değil", "Konumu kullanma",
+        "Bu sitede izin verme", "İzin verme", "Reddet", "Vazgeç", "Kapat",
+        "No thanks", "Not now", "Never", "Don't allow", "Block", "Dismiss",
+    ]
+    try:
+        for m in metinler:
+            try:
+                btns = driver.find_elements(
+                    By.XPATH,
+                    f"//button[contains(normalize-space(.), '{m}')]"
+                    f" | //*[@role='button'][contains(normalize-space(.), '{m}')]"
+                    f" | //div[@role='button'][contains(normalize-space(.), '{m}')]"
+                    f" | //g-raised-button[contains(normalize-space(.), '{m}')]"
+                    f" | //a[contains(normalize-space(.), '{m}')]")
+                for b in btns:
+                    try:
+                        if b.is_displayed():
+                            try:
+                                b.click()
+                            except Exception:
+                                driver.execute_script("arguments[0].click();", b)
+                            insanca_bekle(0.2, 0.5)
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
 def sonuc_bekle(driver, sn=20):
     """Sonuç sayfasını bekle: #search VEYA #rso VEYA h3 linkleri."""
     return WebDriverWait(driver, sn).until(
@@ -443,17 +482,36 @@ def _host_es(href, domain):
 
 
 def _gorunur_hostlar(driver, limit=15):
-    """Organik sonuçların host listesini döndür (teşhis/log için)."""
+    """Organik sonuçların host listesini döndür (teşhis/log için). Mobil + masaüstü.
+
+    Mobilde 'a h3' boş kalabilir -> birden çok seçici dener.
+    """
     hostlar = []
+    seciciler = ("a h3", "#rso a[href]", "#search a[href]",
+                 "div[data-hveid] a[href]", "a[href]")
     try:
-        for h3 in driver.find_elements(By.CSS_SELECTOR, "a h3"):
+        for sel in seciciler:
             try:
-                a = h3.find_element(By.XPATH, "./ancestor::a[1]")
-                h = _href_host(a.get_attribute("href") or "")
-                if h and h not in hostlar:
-                    hostlar.append(h)
+                if sel == "a h3":
+                    elems = []
+                    for h3 in driver.find_elements(By.CSS_SELECTOR, "a h3"):
+                        try:
+                            elems.append(h3.find_element(By.XPATH, "./ancestor::a[1]"))
+                        except Exception:
+                            continue
+                else:
+                    elems = driver.find_elements(By.CSS_SELECTOR, sel)
             except Exception:
-                continue
+                elems = []
+            for a in elems:
+                try:
+                    h = _href_host(a.get_attribute("href") or "")
+                    if h and "google" not in h and h not in hostlar:
+                        hostlar.append(h)
+                except Exception:
+                    continue
+            if len(hostlar) >= 3:   # yeterli örnek toplandı
+                break
     except Exception:
         pass
     return hostlar[:limit]
@@ -727,6 +785,33 @@ def _reklam_domainleri_topla(driver, log_cb):
     return bulunan
 
 
+def _ag_bekle_ve_ac(driver, url, log_cb, iptal_mi=None, deneme=5):
+    """URL'i aç; internet yoksa (ERR_INTERNET_DISCONNECTED vb.) ağ gelene kadar bekle-tekrar dene.
+
+    Özellikle gerçek telefon + uçak modu IP yenileme sonrası ağ geç gelirse işe yarar.
+    """
+    ag_hatalari = ("ERR_INTERNET_DISCONNECTED", "ERR_NETWORK_CHANGED",
+                   "ERR_NAME_NOT_RESOLVED", "ERR_PROXY_CONNECTION_FAILED",
+                   "ERR_CONNECTION_RESET", "ERR_ADDRESS_UNREACHABLE")
+    for i in range(deneme):
+        if iptal_mi and iptal_mi():
+            return
+        try:
+            driver.get(url)
+            return
+        except Exception as ex:
+            m = str(ex)
+            if any(h in m for h in ag_hatalari):
+                bekle = 4 + i * 3
+                _log(log_cb, f"  ! İnternet yok, {bekle} sn bekle, tekrar dene "
+                             f"({i + 1}/{deneme})...")
+                time.sleep(bekle)
+                continue
+            raise
+    # son deneme: başarısızsa hatayı yükselt
+    driver.get(url)
+
+
 def _mobil_emulasyon():
     """Chrome mobil cihaz emülasyonu sözlüğü (Pixel 7 benzeri, mobil UA)."""
     major = _chrome_major() or 124
@@ -738,8 +823,62 @@ def _mobil_emulasyon():
     }
 
 
+def _reklamlari_sirayla_isle(driver, domainler, log_cb, serp_url, iptal_mi,
+                             gez_dongu=5):
+    """Reklamları YUKARIDAN AŞAĞIYA sırayla gez; her birinin domaini listede mi bak.
+
+    Akış: kaydır -> ilk reklamı bul -> listede mi? varsa GİR (tıkla-gez-dön), yoksa atla
+          -> sıradaki işlenmemiş reklama geç -> tüm reklamlar bitene kadar tekrar.
+    SERP'e dönünce DOM değişir; işlenenler domain ile takip edilir (tekrar girilmez).
+    """
+    liste = set(_temiz_domain(d) for d in domainler)
+    islenmis = set()      # girilen ya da atlanan reklam domainleri
+    girilen = 0
+    while True:
+        if iptal_mi():
+            _log(log_cb, "İptal edildi.")
+            break
+        konum_popup_kapat(driver)
+        _tum_sayfayi_kaydir(driver)        # tüm reklamlar (üst+alt) yüklensin
+
+        # sayfadaki reklamları DOM sırasıyla (üstten alta) domainleriyle al, tekrarsız
+        sirali = []
+        gorulen = set()
+        for a in _reklam_linkleri(driver):
+            try:
+                rd = _temiz_domain(_reklam_domain(a.get_attribute("href") or ""))
+            except Exception:
+                rd = ""
+            if rd and rd not in gorulen:
+                gorulen.add(rd)
+                sirali.append(rd)
+
+        # ilk İŞLENMEMİŞ reklamı seç (sıradaki)
+        rd = next((d for d in sirali if d not in islenmis), None)
+        if rd is None:
+            break                          # tüm reklamlar işlendi
+
+        islenmis.add(rd)
+        if rd in liste:
+            hedef = _reklam_link_bul(driver, rd)
+            if hedef:
+                _log(log_cb, f"  ✓ reklam listende VAR: {rd} -> giriliyor")
+                _siteyi_gez(driver, hedef, log_cb, f"[Ad] {rd}", serp_url,
+                            gez_dongu=gez_dongu)
+                girilen += 1
+            else:
+                _log(log_cb, f"  ! '{rd}' reklamı tekrar bulunamadı, atlandı.")
+        else:
+            _log(log_cb, f"  – reklam listende yok: {rd} -> atlandı")
+
+    _log(log_cb, f"  Reklam tarama bitti: {girilen} listedeki reklama girildi, "
+                 f"{len(islenmis)} reklam kontrol edildi.")
+    return girilen
+
+
 def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
-            sadece_reklam=False, log_cb=None, dur_kontrol=None, mobil=False):
+            sadece_reklam=False, log_cb=None, dur_kontrol=None, mobil=False,
+            gercek_telefon=False, cihaz_seri=None):
     """
     Tek bir arama çalıştır.
       arama         : aranacak kelime (str)
@@ -752,6 +891,9 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
       log_cb        : log mesajı için callback fn(str)
       dur_kontrol   : iptal için fn() -> True dönerse durur
       mobil         : True ise Chrome'u telefon emülasyonunda açar (dar viewport + mobil UA)
+      gercek_telefon: True ise ADB ile bağlı GERÇEK Android telefondaki Chrome'u sürer
+                      (androidPackage). Gerçek mobil fingerprint + IP. uc/emülasyon kullanılmaz.
+      cihaz_seri    : gercek_telefon için hedef cihaz serisi (birden çok cihaz varsa)
     """
 
     def iptal_mi():
@@ -774,13 +916,37 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
             op.add_argument("--window-size=1920,1080")
 
     driver = None
-    if uc is not None:
+    if gercek_telefon:
+        # --- GERÇEK telefon: ADB ile bağlı cihazdaki Chrome'u sür (androidPackage) ---
+        # chromedriver, cihazın Chrome sürümüne uygun olmalı. Selenium Manager indirir.
+        # chromedriver adb'yi PATH'ten bulur -> adb klasörünü PATH'e ekle.
+        try:
+            adb_dir = os.path.dirname(adb_bul())
+            if adb_dir and adb_dir not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = adb_dir + os.pathsep + os.environ.get("PATH", "")
+        except Exception:
+            pass
+        op = webdriver.ChromeOptions()
+        op.add_experimental_option("androidPackage", "com.android.chrome")
+        if cihaz_seri:
+            op.add_experimental_option("androidDeviceSerial", cihaz_seri)
+        op.add_argument("--disable-blink-features=AutomationControlled")
+        op.add_experimental_option("excludeSwitches", ["enable-automation"])
+        op.add_argument("--lang=tr-TR")
+        _log(log_cb, f"Telefon Chrome'u açılıyor (ADB)... "
+                     f"cihaz: {cihaz_seri or 'otomatik'}, arama: '{arama}'")
+        driver = webdriver.Chrome(options=op)
+    elif uc is not None:
         # undetected-chromedriver: Google bot tespitini ciddi azaltır.
         # NOT: uc kendi profilini yönetir -> custom --user-data-dir / --no-sandbox VERME.
         # uc'nin oto sürüm tespiti bozuk olabilir -> major'u biz veriyoruz.
         try:
             op = uc.ChromeOptions()
             op.add_argument("--lang=tr-TR")
+            op.add_experimental_option("prefs", {
+                "profile.default_content_setting_values.geolocation": 2,  # 2 = blokla
+                "profile.default_content_setting_values.notifications": 2,
+            })
             if mobil:
                 op.add_experimental_option("mobileEmulation", _mobil_emulasyon())
                 op.add_argument("--window-size=412,915")
@@ -805,7 +971,7 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
             _log(log_cb, f"uc başarısız ({str(ex)[:80]}), düz Selenium'a geçiliyor.")
             driver = None
 
-    if driver is None:
+    if driver is None and not gercek_telefon:
         # Yedek: düz Selenium
         op = webdriver.ChromeOptions()
         if not mobil:
@@ -817,6 +983,10 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
         op.add_experimental_option("excludeSwitches", ["enable-automation"])
         op.add_experimental_option("useAutomationExtension", False)
         op.add_argument("--disable-infobars")
+        op.add_experimental_option("prefs", {
+            "profile.default_content_setting_values.geolocation": 2,  # 2 = blokla
+            "profile.default_content_setting_values.notifications": 2,
+        })
         if mobil:
             op.add_experimental_option("mobileEmulation", _mobil_emulasyon())
         _ortak_arg(op)
@@ -828,10 +998,33 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
         _log(log_cb, f"Chrome açılıyor... arama: '{arama}'")
         driver = webdriver.Chrome(options=op)
 
-    _stealth_uygula(driver)
+    if gercek_telefon:
+        # Gerçek cihaz: mobil fingerprint'i BOZMA. Sadece webdriver izini gizle.
+        try:
+            driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"})
+        except Exception:
+            pass
+    else:
+        _stealth_uygula(driver)
+
+    # Konum iznini CDP ile REDDET (popup hiç çıkmasın). Her modda denenir.
+    for _kok in ("https://www.google.com", "https://www.google.com.tr"):
+        try:
+            driver.execute_cdp_cmd("Browser.setPermission", {
+                "origin": _kok,
+                "permission": {"name": "geolocation"},
+                "setting": "denied",
+            })
+        except Exception:
+            pass
 
     try:
-        driver.get("https://www.google.com/ncr")
+        # internet yoksa (uçak modu yeni kapandıysa) bekle-tekrar dene
+        _ag_bekle_ve_ac(driver, "https://www.google.com/ncr", log_cb, iptal_mi)
+        if iptal_mi():
+            return
         # sayfa yükü sonrası KISA sabit bekleme (insanca_bekle'nin uzun kuyruğu yok)
         time.sleep(random.uniform(0.3, 0.7))
         cerez_kapat(driver)
@@ -876,6 +1069,9 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
                 raise
 
         insanca_bekle()
+        # konum/izin popup'ı çıktıysa reddederek kapat (sayfayı bloklamasın)
+        if konum_popup_kapat(driver):
+            _log(log_cb, "  Konum izni penceresi kapatıldı.")
         serp_url = driver.current_url   # sonuç sayfasına kesin dönmek için
         mouse_gezin(driver, dongu=2)
 
@@ -895,26 +1091,8 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
             _log(log_cb, f"  {len(rek)} reklam linki bulundu. "
                          f"Reklam siteleri: {', '.join(sorted(set(d for d in rek_domainler if d))) or '-'}")
             if domainler:
-                # listemizdeki domainlerden reklam olarak çıkanları SIRAYLA tıkla
-                temiz_liste = [_temiz_domain(d) for d in domainler]
-                ortusen = [d for d in temiz_liste
-                           if any(d and d in (rd or "") for rd in rek_domainler)]
-                _log(log_cb, f"  Örtüşen (listede + reklam): "
-                             f"{', '.join(ortusen) or 'YOK'}")
-                tiklanan = 0
-                for domain in ortusen:
-                    if iptal_mi():
-                        _log(log_cb, "İptal edildi.")
-                        break
-                    # SERP'e dönünce reklamı TAZE bul (DOM değişti)
-                    hedef = _reklam_link_bul(driver, domain)
-                    if hedef:
-                        _siteyi_gez(driver, hedef, log_cb, f"[Ad] {domain}", serp_url)
-                        tiklanan += 1
-                    else:
-                        _log(log_cb, f"  ! '{domain}' reklamı tekrar bulunamadı, atlandı.")
-                _log(log_cb, f"  {tiklanan}/{len(ortusen)} örtüşen reklama tıklandı. "
-                             f"Bitti -> uçak modu sırada.")
+                # Reklamları YUKARIDAN AŞAĞIYA sırayla gez; listende olana gir, olmayanı atla
+                _reklamlari_sirayla_isle(driver, domainler, log_cb, serp_url, iptal_mi)
             else:
                 # site belirtilmemiş: ilk N reklamı tıkla (back sonrası yeniden çek)
                 for i in range(tiklama):
@@ -930,6 +1108,7 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
             # --- Hedef site(ler): SERP'teki gerçek sonuca TIKLA ---
             # Her domaini SERP'te taze bul, tıkla, gez, SERP'e dön, sıradakine geç.
             mouse_gezin(driver, dongu=1)
+            konum_popup_kapat(driver)     # geç çıkan konum penceresini kapat
             _tum_sayfayi_kaydir(driver)   # tüm sonuç + alt reklamlar yüklensin
             # SERP'teki reklam domainlerini sadece logla (listeye ekleme yok)
             _reklam_domainleri_topla(driver, log_cb)
