@@ -289,6 +289,32 @@ def mouse_gezin(driver, dongu=3):
         insanca_bekle(0.5, 1.2)
 
 
+def _tum_sayfayi_kaydir(driver, max_adim=14):
+    """Sayfayı parça parça EN ALTA kadar indir (lazy sonuç + alt reklamlar yüklensin), sonra başa dön.
+
+    Aşağıdaki organik sonuçlar ve #bottomads reklamları ancak scroll'la DOM'a gelir.
+    Bu yapılmazsa hedef domain sayfada 'görünür' ama bot bulamaz/tıklayamaz.
+    """
+    try:
+        son_y = -1
+        for _ in range(max_adim):
+            driver.execute_script(
+                f"window.scrollBy({{top: {random.randint(450, 850)}, behavior:'smooth'}});")
+            insanca_bekle(0.4, 0.9)
+            y = driver.execute_script("return window.scrollY + window.innerHeight;")
+            toplam = driver.execute_script("return document.body.scrollHeight;")
+            if y >= toplam - 5:       # dibe vardı
+                break
+            if abs(y - son_y) < 5:    # daha inmiyor
+                break
+            son_y = y
+        insanca_bekle(0.5, 1.0)
+        driver.execute_script("window.scrollTo({top: 0, behavior:'smooth'});")
+        insanca_bekle(0.6, 1.2)
+    except Exception:
+        pass
+
+
 # QWERTY komşuluk — typo simülasyonu için (yanlış tuş = komşu tuş)
 _KOMSU = {
     "q": "wa", "w": "qeas", "e": "wrds", "r": "etdf", "t": "ryfg",
@@ -782,6 +808,7 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
             # --- Hedef site(ler): SERP'teki gerçek sonuca TIKLA ---
             # Her domaini SERP'te taze bul, tıkla, gez, SERP'e dön, sıradakine geç.
             mouse_gezin(driver, dongu=1)
+            _tum_sayfayi_kaydir(driver)   # tüm sonuç + alt reklamlar yüklensin
             # insan gibi: %25 ihtimalle önce ilgisiz bir sonuca tıkla-dön
             if not iptal_mi() and random.random() < 0.25:
                 _yanlis_tikla_don(driver, serp_url, log_cb, kacin=domainler)
@@ -790,12 +817,23 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
                 if iptal_mi():
                     _log(log_cb, "İptal edildi.")
                     break
+                # 1) organik sonuçta ara
                 hedef = _hedef_link_bul(driver, domain)
+                etiket = domain
+                # 2) bulunamazsa REKLAM (Ad/Sponsorlu) içinde ara
                 if not hedef:
-                    _log(log_cb, f"  ! '{domain}' ilk sayfada yok, atlandı.")
+                    hedef = _reklam_link_bul(driver, domain)
+                    if hedef:
+                        etiket = f"[Ad] {domain}"
+                if not hedef:
+                    _log(log_cb, f"  ! '{domain}' ilk sayfada yok (organik+reklam), atlandı.")
                     continue
-                _siteyi_gez(driver, hedef, log_cb, domain, serp_url)
+                _log(log_cb, f"  '{domain}' bulundu ({etiket}), tıklanıyor.")
+                _siteyi_gez(driver, hedef, log_cb, etiket, serp_url)
                 tiklanan += 1
+                # SERP'e dönünce DOM yenilendi -> alt reklam/sonuçlar tekrar yüklensin
+                if not iptal_mi():
+                    _tum_sayfayi_kaydir(driver)
             _log(log_cb, f"  {tiklanan}/{len(domainler)} hedefe tıklandı.")
         else:
             # --- Hedef yok: ilk N sonuca tıkla ---
