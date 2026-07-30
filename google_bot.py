@@ -11,10 +11,12 @@ import sys
 import time
 import random
 import shutil
+import sqlite3
 import tempfile
 import subprocess
 
 from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
@@ -25,6 +27,33 @@ try:
     import undetected_chromedriver as uc
 except Exception:
     uc = None
+
+# Başlangıç sayfası. '/ncr' KULLANILMAZ (arayüzü İngilizce/ABD yapıyordu).
+GOOGLE_URL = "https://www.google.com.tr/?hl=tr&gl=tr"
+
+
+def _pathteki_chromedriver_gizle(log_cb=None):
+    """PATH'te eski bir chromedriver.exe varsa Selenium onu kullanır ve
+    'this version of chromedriver only supports chrome version XX' hatası verir.
+    Çözüm: chromedriver.exe içeren klasörleri BU process'in PATH'inden çıkar ->
+    Selenium Manager doğru sürümü kendisi indirir. (Sisteme dokunulmaz.)"""
+    try:
+        parcalar = os.environ.get("PATH", "").split(os.pathsep)
+        temiz, atilan = [], []
+        for p in parcalar:
+            try:
+                if p and os.path.isfile(os.path.join(p, "chromedriver.exe")):
+                    atilan.append(p)
+                    continue
+            except Exception:
+                pass
+            temiz.append(p)
+        if atilan:
+            os.environ["PATH"] = os.pathsep.join(temiz)
+            _log(log_cb, "PATH'te eski chromedriver bulundu, yok sayıldı: "
+                         + "; ".join(atilan))
+    except Exception:
+        pass
 
 
 def _chrome_major():
@@ -61,6 +90,268 @@ def _temel_klasor():
 
 
 MASAUSTU = _temel_klasor()
+
+
+# ---------------- Reklam domain veritabanı (yerel SQLite) ----------------
+# Aramalarda görülen TÜM reklam (Ad/Sponsorlu) domainleri buraya kaydedilir.
+# Dosya exe/script yanında: reklam_domainleri.db
+
+# Bu domainler ASLA kaydedilmez (kendi sitem + Google gürültüsü).
+# Kalıcı liste DB'deki 'engelli_domainler' tablosunda tutulur; aşağıdakiler
+# tablo ilk oluşturulurken bir kez tohum olarak yazılır. Panelden yönetilir.
+VARSAYILAN_ENGELLILER = {
+    "tufantesisat.com.tr",
+    "google.com", "google.com.tr", "gstatic.com",
+    "googleadservices.com", "googlesyndication.com", "doubleclick.net",
+}
+
+
+def _engelli_kume():
+    """Kara listeyi DB'den oku. DB açılamazsa varsayılanlara düş."""
+    try:
+        con = _db_baglan()
+        satirlar = con.execute("SELECT domain FROM engelli_domainler").fetchall()
+        con.close()
+        return {r[0] for r in satirlar}
+    except Exception:
+        return set(VARSAYILAN_ENGELLILER)
+
+
+def _engelli_mi(domain, kume=None):
+    """domain kara listede mi? (alt alan adları da: x.google.com -> google.com)."""
+    d = _temiz_domain(domain)
+    if not d:
+        return True
+    if kume is None:
+        kume = _engelli_kume()
+    for e in kume:
+        if d == e or d.endswith("." + e):
+            return True
+    return False
+
+
+def engelli_listele():
+    """Kara listedeki domainleri döndür: [(domain, eklenme), ...]."""
+    try:
+        con = _db_baglan()
+        satirlar = con.execute(
+            "SELECT domain, eklenme FROM engelli_domainler"
+            " ORDER BY domain").fetchall()
+        con.close()
+        return satirlar
+    except Exception:
+        return []
+
+
+def engelli_ekle(domain):
+    """Kara listeye domain ekle; hedef DB'deki eşleşen kayıtları da temizler.
+
+    Döner: eklendi ise True; geçersiz domain ya da zaten listede ise False.
+    """
+    d = _temiz_domain(domain)
+    if not _gecerli_domain(d):
+        return False
+    try:
+        con = _db_baglan()
+        with con:
+            cur = con.execute(
+                "INSERT OR IGNORE INTO engelli_domainler(domain, eklenme)"
+                " VALUES(?,?)", (d, time.strftime("%Y-%m-%d %H:%M:%S")))
+            # bu domaine (ve alt alanlarına) ait hedef kayıtları artık kullanılmasın
+            con.execute("DELETE FROM reklam_domainleri"
+                        " WHERE domain=? OR domain LIKE ?", (d, "%." + d))
+        con.close()
+        return cur.rowcount > 0
+    except Exception:
+        return False
+
+
+def engelli_sil(domain):
+    """Kara listeden domain çıkar. Başarılıysa True."""
+    d = _temiz_domain(domain)
+    if not d:
+        return False
+    try:
+        con = _db_baglan()
+        with con:
+            con.execute("DELETE FROM engelli_domainler WHERE domain=?", (d,))
+        con.close()
+        return True
+    except Exception:
+        return False
+
+
+def _gecerli_domain(d):
+    """Gerçek alan adı mı? tel:/mailto:/telefon no/yol içerenler ELENİR.
+
+    Kural: en az bir nokta, sadece [a-z0-9.-], ':/@?# boşluk' yasak,
+           TLD (son parça) harf ve >=2.
+    """
+    d = _temiz_domain(d)
+    if not d or "." not in d:
+        return False
+    if any(c in d for c in (":", "/", " ", "@", "?", "#", "%")):
+        return False
+    izin = set("abcdefghijklmnopqrstuvwxyz0123456789.-")
+    if any(c not in izin for c in d):
+        return False
+    tld = d.rsplit(".", 1)[-1]
+    return len(tld) >= 2 and tld.isalpha()
+
+
+def db_yolu():
+    """Reklam domain DB'sinin tam yolu (exe/script klasörü)."""
+    ozel = os.environ.get("REKLAM_DB_YOLU")
+    if ozel:
+        return ozel
+    return os.path.join(MASAUSTU, "reklam_domainleri.db")
+
+
+def _db_baglan():
+    """DB'ye bağlan, tablo yoksa oluştur. Bağlantı döner."""
+    con = sqlite3.connect(db_yolu(), timeout=10)
+    # kara liste tablosu: ilk oluşturmada varsayılanlarla tohumla
+    kara_var = con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+        " AND name='engelli_domainler'").fetchone()
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS engelli_domainler("
+        " domain TEXT PRIMARY KEY,"
+        " eklenme TEXT)")
+    if kara_var is None:
+        su_an = time.strftime("%Y-%m-%d %H:%M:%S")
+        con.executemany(
+            "INSERT OR IGNORE INTO engelli_domainler(domain, eklenme)"
+            " VALUES(?,?)", [(d, su_an) for d in sorted(VARSAYILAN_ENGELLILER)])
+        con.commit()
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS reklam_domainleri("
+        " domain TEXT PRIMARY KEY,"
+        " ilk_gorulme TEXT,"
+        " son_gorulme TEXT,"
+        " gorulme_sayisi INTEGER DEFAULT 0,"
+        " son_arama TEXT,"
+        " aramalar TEXT)")            # domainin bulunduğu TÜM aramalar (virgülle)
+    # eski DB'de 'aramalar' kolonu yoksa ekle (migrasyon)
+    try:
+        kolonlar = [r[1] for r in con.execute("PRAGMA table_info(reklam_domainleri)")]
+        if "aramalar" not in kolonlar:
+            con.execute("ALTER TABLE reklam_domainleri ADD COLUMN aramalar TEXT")
+        # boş 'aramalar' olan eski kayıtları son_arama ile doldur
+        con.execute("UPDATE reklam_domainleri SET aramalar=son_arama"
+                    " WHERE (aramalar IS NULL OR aramalar='') AND son_arama IS NOT NULL")
+        con.commit()
+    except Exception:
+        pass
+    return con
+
+
+def reklam_domain_kaydet(domainler, arama="", log_cb=None):
+    """Reklam domainlerini DB'ye yaz (upsert): yeni ise ekle, varsa sayacı artır.
+
+    domainler: domain string listesi (boş/None atlanır, tekilleştirilir).
+    Döner: bu çağrıda İLK KEZ görülen (yeni eklenen) domain listesi.
+    """
+    temiz = sorted({_temiz_domain(d) for d in (domainler or []) if d and d.strip()})
+    # sadece GERÇEK alan adları + kara liste dışı (tel:/mailto:/telefon no elenir)
+    engelli = _engelli_kume()
+    temiz = [d for d in temiz if _gecerli_domain(d) and not _engelli_mi(d, engelli)]
+    if not temiz:
+        return []
+    su_an = time.strftime("%Y-%m-%d %H:%M:%S")
+    yeni = []
+    try:
+        con = _db_baglan()
+        with con:
+            for d in temiz:
+                onceki = con.execute(
+                    "SELECT aramalar FROM reklam_domainleri WHERE domain=?",
+                    (d,)).fetchone()
+                if onceki is None:
+                    # yeni domain
+                    yeni.append(d)
+                    aramalar = arama or ""
+                    con.execute(
+                        "INSERT INTO reklam_domainleri"
+                        "(domain, ilk_gorulme, son_gorulme, gorulme_sayisi,"
+                        " son_arama, aramalar) VALUES(?,?,?,1,?,?)",
+                        (d, su_an, su_an, arama, aramalar))
+                else:
+                    # var olan: aramalar kümesini birleştir (domain hangi aramalarda çıktı)
+                    mevcut = set(x for x in (onceki[0] or "").split(",") if x)
+                    if arama:
+                        mevcut.add(arama)
+                    aramalar = ",".join(sorted(mevcut))
+                    con.execute(
+                        "UPDATE reklam_domainleri SET son_gorulme=?,"
+                        " gorulme_sayisi=gorulme_sayisi+1, son_arama=?, aramalar=?"
+                        " WHERE domain=?",
+                        (su_an, arama, aramalar, d))
+        con.close()
+        if yeni:
+            _log(log_cb, f"  DB: {len(yeni)} yeni reklam domaini kaydedildi "
+                         f"({', '.join(yeni)}).")
+    except Exception as ex:
+        _log(log_cb, f"  DB yazma hatası: {str(ex)[:70]}")
+    return yeni
+
+
+def reklam_domainleri_listele(sirala="son_gorulme"):
+    """Kayıtlı tüm reklam domainlerini döndür: [(domain, sayi, ilk, son, arama), ...]."""
+    izin = {"son_gorulme", "ilk_gorulme", "gorulme_sayisi", "domain"}
+    kol = sirala if sirala in izin else "son_gorulme"
+    try:
+        con = _db_baglan()
+        satirlar = con.execute(
+            f"SELECT domain, gorulme_sayisi, ilk_gorulme, son_gorulme, son_arama"
+            f" FROM reklam_domainleri ORDER BY {kol} DESC").fetchall()
+        con.close()
+        return satirlar
+    except Exception:
+        return []
+
+
+def hedef_domainler_db(arama=None):
+    """Hedef domainleri döndür.
+
+    arama verilirse: SADECE o aramada bulunmuş domainler + elle eklenenler ('manuel').
+      (Bir tesisat reklamı sadece kendi kelimesinde çıkar; alakasız aramada boşuna
+       denenmesin -> 'reklamda yok, atlandı' gürültüsü olmasın.)
+    arama None ise: tüm domainler.
+    """
+    try:
+        con = _db_baglan()
+        satirlar = con.execute(
+            "SELECT domain, aramalar FROM reklam_domainleri").fetchall()
+        con.close()
+    except Exception:
+        return []
+    if arama is None:
+        return [r[0] for r in satirlar if r and r[0]]
+    a = (arama or "").strip().lower()
+    out = []
+    for dom, aramalar in satirlar:
+        if not dom:
+            continue
+        kume = set(x.strip().lower() for x in (aramalar or "").split(",") if x.strip())
+        if a in kume or "manuel" in kume:
+            out.append(dom)
+    return out
+
+
+def reklam_domain_sil(domain):
+    """Bir domaini DB'den sil. Başarılıysa True."""
+    d = _temiz_domain(domain)
+    if not d:
+        return False
+    try:
+        con = _db_baglan()
+        with con:
+            con.execute("DELETE FROM reklam_domainleri WHERE domain=?", (d,))
+        con.close()
+        return True
+    except Exception:
+        return False
 
 
 # Tarayıcı parmak izini insanlaştırır: webdriver/plugins/languages/chrome/WebGL/permissions.
@@ -115,12 +406,14 @@ STEALTH_JS = r"""
   } catch (e) {}
 
   // 6) WebGL vendor/renderer — gerçek GPU dizesi (SwiftShader headless'i ele verir)
+  //    Değerler çalışma başına RASTGELE (aşağıdaki yer-tutucular Python'da doldurulur)
+  //    -> her oturum farklı donanım parmak izi, kümelenip yakalanmaz.
   try {
     const yama = (proto) => {
       const orj = proto.getParameter;
       proto.getParameter = function (p) {
-        if (p === 37445) return 'Google Inc. (Intel)';                    // UNMASKED_VENDOR
-        if (p === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)'; // UNMASKED_RENDERER
+        if (p === 37445) return '__WEBGL_VENDOR__';    // UNMASKED_VENDOR
+        if (p === 37446) return '__WEBGL_RENDERER__';  // UNMASKED_RENDERER
         return orj.call(this, p);
       };
     };
@@ -128,9 +421,9 @@ STEALTH_JS = r"""
     if (window.WebGL2RenderingContext) yama(WebGL2RenderingContext.prototype);
   } catch (e) {}
 
-  // 7) hardwareConcurrency / deviceMemory — gerçekçi sabitler
-  try { Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8}); } catch (e) {}
-  try { Object.defineProperty(navigator, 'deviceMemory', {get: () => 8}); } catch (e) {}
+  // 7) hardwareConcurrency / deviceMemory — çalışma başına rastgele (gerçekçi)
+  try { Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => __CORES__}); } catch (e) {}
+  try { Object.defineProperty(navigator, 'deviceMemory', {get: () => __MEM__}); } catch (e) {}
 
   // 8) Notification.permission 'default' (otomasyonda bazen 'denied')
   try {
@@ -138,20 +431,126 @@ STEALTH_JS = r"""
       Object.defineProperty(Notification, 'permission', {get: () => 'default'});
     }
   } catch (e) {}
+
+  // 9) User-Agent Client Hints — mobil emülasyonda platform 'Windows' sızıyordu.
+  //    (Python yer-tutucusu: masaüstünde boş, mobilde Android UA-CH ile doldurulur.)
+  __UACH_BLOCK__
 })();
 """
 
 
-def _stealth_uygula(driver):
-    """Stealth JS'i hem yeni dokümanlar için kaydet hem mevcut sayfaya enjekte et."""
+# GPU vendor/renderer havuzu — gerçek Windows makinelerde yaygın kartlar.
+# Her (vendor, renderer) çifti tutarlı; çalışma başına rastgele biri seçilir.
+_GPU_HAVUZ = [
+    ('Google Inc. (Intel)',
+     'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)'),
+    ('Google Inc. (Intel)',
+     'ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)'),
+    ('Google Inc. (Intel)',
+     'ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)'),
+    ('Google Inc. (NVIDIA)',
+     'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)'),
+    ('Google Inc. (NVIDIA)',
+     'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)'),
+    ('Google Inc. (NVIDIA)',
+     'ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 Direct3D11 vs_5_0 ps_5_0, D3D11)'),
+    ('Google Inc. (AMD)',
+     'ANGLE (AMD, AMD Radeon(TM) Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)'),
+    ('Google Inc. (AMD)',
+     'ANGLE (AMD, Radeon RX 580 Series Direct3D11 vs_5_0 ps_5_0, D3D11)'),
+]
+
+
+def _parmak_izi_uret(mobil=False):
+    """Çalışma başına tutarlı donanım parmak izi seç.
+
+    mobil=True: UA Pixel 7 (Tensor G2 / Mali GPU) olduğu için WebGL de MOBİL
+    olmalı — masaüstü Intel/NVIDIA dizesi verirsek UA ile çelişir, bot sinyali.
+    """
+    if mobil:
+        # Pixel 7 ile tutarlı sabit mobil parmak izi (UA sabit olduğu için bu da sabit).
+        return {
+            "vendor": "Google Inc. (ARM)",
+            "renderer": "ANGLE (ARM, Mali-G710 MC10, OpenGL ES 3.2)",
+            "cores": 8,
+            "mem": 8,
+        }
+    vendor, renderer = random.choice(_GPU_HAVUZ)
+    # deviceMemory Chrome'da 8 ile tavanlanır; cores gerçekçi değerler.
+    return {
+        "vendor": vendor,
+        "renderer": renderer,
+        "cores": random.choice([4, 6, 8, 8, 12, 16]),
+        "mem": random.choice([4, 8, 8]),
+    }
+
+
+def _uach_blok_mobil(major):
+    """Mobil emülasyonda navigator.userAgentData'yı Android/Pixel 7 ile tutarlı yap.
+
+    Emülasyonda UA dizesi 'Android' der ama Client Hints platform 'Windows'
+    sızdırır -> çelişki. Burada userAgentData'yı Android olarak yeniden tanımlarız.
+    """
+    return r"""
+  try {
+    const M = '__MAJOR__';
+    const brands = [
+      {brand: 'Chromium', version: M},
+      {brand: 'Google Chrome', version: M},
+      {brand: 'Not-A.Brand', version: '99'}
+    ];
+    const fullVer = M + '.0.0.0';
+    const uaData = {
+      brands: brands,
+      mobile: true,
+      platform: 'Android',
+      getHighEntropyValues: function (hints) {
+        return Promise.resolve({
+          brands: brands,
+          mobile: true,
+          platform: 'Android',
+          platformVersion: '13.0.0',
+          architecture: '',
+          bitness: '',
+          model: 'Pixel 7',
+          uaFullVersion: fullVer,
+          fullVersionList: [
+            {brand: 'Chromium', version: fullVer},
+            {brand: 'Google Chrome', version: fullVer},
+            {brand: 'Not-A.Brand', version: '99.0.0.0'}
+          ]
+        });
+      },
+      toJSON: function () { return {brands: brands, mobile: true, platform: 'Android'}; }
+    };
+    Object.defineProperty(navigator, 'userAgentData', {get: () => uaData});
+  } catch (e) {}
+""".replace("__MAJOR__", str(major))
+
+
+def _stealth_js_uret(fp=None, mobil=False):
+    """STEALTH_JS şablonundaki yer-tutucuları parmak izi + UA-CH ile doldur."""
+    fp = fp or _parmak_izi_uret(mobil=mobil)
+    uach = _uach_blok_mobil(_chrome_major() or 124) if mobil else ""
+    return (STEALTH_JS
+            .replace("__WEBGL_VENDOR__", fp["vendor"])
+            .replace("__WEBGL_RENDERER__", fp["renderer"])
+            .replace("__CORES__", str(fp["cores"]))
+            .replace("__MEM__", str(fp["mem"]))
+            .replace("__UACH_BLOCK__", uach))
+
+
+def _stealth_uygula(driver, fp=None, mobil=False):
+    """Rastgele parmak izli stealth JS'i yeni dokümanlar için kaydet + mevcut sayfaya enjekte et."""
+    kaynak = _stealth_js_uret(fp or _parmak_izi_uret(mobil=mobil), mobil=mobil)
     try:
         driver.execute_cdp_cmd(
-            "Page.addScriptToEvaluateOnNewDocument", {"source": STEALTH_JS}
+            "Page.addScriptToEvaluateOnNewDocument", {"source": kaynak}
         )
     except Exception:
         pass
     try:
-        driver.execute_script(STEALTH_JS)
+        driver.execute_script(kaynak)
     except Exception:
         pass
 
@@ -164,7 +563,7 @@ def _log(cb, mesaj):
         print(mesaj)
 
 
-def insanca_bekle(a=0.6, b=1.8):
+def insanca_bekle(a=0.6, b=1.8, maks=None):
     """İnsan gibi DÜZENSİZ bekleme. Tek tip uniform değil; ağırlıklı karışık dağılım.
 
     Patternler:
@@ -173,6 +572,7 @@ def insanca_bekle(a=0.6, b=1.8):
       ~%15 okuma/düşünme : [b, b*2.2]
       ~%5  dalgınlık     : [b*2.5, b*4.5]
     Üstüne mikro jitter (gauss) eklenir.
+    maks: üst sınır (sn) — site içi gezinmede uzun 'dalgınlık' donması olmasın diye.
     """
     r = random.random()
     if r < 0.15:
@@ -186,6 +586,8 @@ def insanca_bekle(a=0.6, b=1.8):
     else:
         t = random.uniform(b * 2.5, b * 4.5)
     t += random.gauss(0, 0.08)
+    if maks is not None:
+        t = min(t, maks)
     time.sleep(max(0.05, t))
 
 
@@ -259,34 +661,101 @@ def _fare_kaydir(driver, x, y, adim=None):
 
 
 def mouse_gezin(driver, dongu=3):
-    """Sayfada fareyle gez: aşağı kaydır + viewport'ta rastgele noktalara süzül + öğe üstünde dur."""
-    actions = ActionChains(driver)
-    for _ in range(dongu):
-        eb = driver.execute_script("return [innerWidth, innerHeight];")
-        gw, gh = eb[0], eb[1]
+    """Sayfada OKUR gibi gez: yukarıdan aşağı ilerle, ara sıra viewport içindeki
+    öğeye hover / küçük yukarı düzeltme yap; dibe varınca durur.
 
-        # 1) viewport üstünde rastgele 2-4 noktada gez
-        for _ in range(random.randint(2, 4)):
-            _fare_kaydir(driver, random.randint(40, gw - 40), random.randint(40, gh - 40))
-            time.sleep(random.uniform(0.15, 0.5))
+    dongu: gezinme bütçesi (eski çağrılarla uyumlu) — adım sayısı sayfa
+    boyundan türetilir, dongu ile tavanlanır. Rastgele elemana scrollIntoView
+    YOK: ilk 30 eleman hep sayfa tepesiydi, gezinme yoyo gibi zıplıyordu.
+    """
+    try:
+        eb = driver.execute_script(
+            "return [document.body.scrollHeight, innerHeight, innerWidth];")
+        toplam, gh, gw = eb[0], eb[1], eb[2]
+    except Exception:
+        return
 
-        # 2) görünür bir öğenin üstüne gerçek fareyle hover yap
-        try:
-            ogeler = driver.find_elements(By.CSS_SELECTOR, "a, h1, h2, h3, p, img, button")
-            ogeler = [o for o in ogeler if o.is_displayed()]
-            if ogeler:
-                hedef = random.choice(ogeler[:30])
-                driver.execute_script(
-                    "arguments[0].scrollIntoView({block:'center', behavior:'smooth'});", hedef
+    # okunacak derinlik: sayfanın %70-100'ü; adım bütçesi boy + dongu'dan
+    hedef_derinlik = toplam * random.uniform(0.7, 1.0)
+    max_adim = max(2, min(dongu * 3, int(hedef_derinlik / 400) + 1))
+
+    for _ in range(max_adim):
+        # ara sıra KISA fare süzülmesi (uzun bezier turu yok — görünmez ve
+        # isTrusted=false olduğundan tespit değeri sıfır, süresi kısaltıldı)
+        if random.random() < 0.4:
+            _fare_kaydir(driver, random.randint(40, gw - 40),
+                         random.randint(40, gh - 40), adim=random.randint(3, 6))
+
+        # ara sıra ŞU AN viewport içinde duran bir öğeye hover (scroll tetiklemez)
+        if random.random() < 0.35:
+            try:
+                hedef = driver.execute_script(
+                    """
+                    var els = document.querySelectorAll('a, h2, h3, p, img, button');
+                    var ic = [];
+                    for (var i = 0; i < els.length && ic.length < 20; i++) {
+                        var r = els[i].getBoundingClientRect();
+                        if (r.width > 20 && r.height > 10 &&
+                            r.top > 40 && r.bottom < innerHeight - 10)
+                            ic.push(els[i]);
+                    }
+                    return ic.length ? ic[Math.floor(arguments[0] * ic.length)] : null;
+                    """,
+                    random.random(),
                 )
+                if hedef:
+                    ActionChains(driver).move_to_element(hedef).perform()
+                    time.sleep(random.uniform(0.2, 0.6))
+            except Exception:
+                pass
+
+        # asıl ilerleme: aşağı kaydır (gerçek telefonda parmakla)
+        if _dokunma_var(driver):
+            _adb_kaydir_asagi(getattr(driver, "_adb_yol", None),
+                              getattr(driver, "_adb_seri", None),
+                              getattr(driver, "_ekran", None))
+        else:
+            if random.random() < 0.15:   # okurken küçük geri dönüş
+                _gercek_scroll(driver, -random.randint(80, 220))
                 time.sleep(random.uniform(0.3, 0.7))
-                actions.move_to_element(hedef).perform()
+            _gercek_scroll(driver, random.randint(250, 650))
+        insanca_bekle(0.5, 1.2, maks=3.0)
+
+        # dibe vardıysa kısa bak, bitir — boş scrollBy'la bekleme yapma
+        try:
+            kon = driver.execute_script(
+                "return [Math.round(scrollY + innerHeight), document.body.scrollHeight];")
+            if kon[0] >= kon[1] - 40:
+                insanca_bekle(0.4, 1.0, maks=2.0)
+                break
+        except Exception:
+            break
+
+
+def _dokunma_var(driver):
+    """Gerçek telefonda ADB dokunma enjeksiyonu kullanılabilir mi?
+    MIUI/HyperOS 'USB hata ayıklama (Güvenlik ayarları)' kapalıysa input tap/swipe
+    SecurityException (INJECT_EVENTS) ile reddedilir -> Selenium/JS'e düşülür."""
+    return (getattr(driver, "_gercek", False)
+            and not getattr(driver, "_dokunma_yok", False))
+
+
+def _gercek_scroll(driver, dy):
+    """Gerçek fare-tekerlek olayı üret (CDP Input -> isTrusted=true).
+
+    JS window.scrollBy programatik sayılır; Google SERP kendi sayfasında scroll
+    davranışını izler. ActionChains.scroll_by_amount CDP üzerinden GERÇEK wheel
+    olayı gönderir. Desteklenmezse JS scrollBy'a düşer.
+    """
+    try:
+        ActionChains(driver).scroll_by_amount(0, int(dy)).perform()
+        return True
+    except Exception:
+        try:
+            driver.execute_script("window.scrollBy(0, arguments[0]);", dy)
         except Exception:
             pass
-
-        # 3) yumuşak aşağı kaydır
-        driver.execute_script(f"window.scrollBy({{top: {random.randint(250, 650)}, behavior:'smooth'}});")
-        insanca_bekle(0.5, 1.2)
+        return False
 
 
 def _tum_sayfayi_kaydir(driver, max_adim=30):
@@ -294,14 +763,20 @@ def _tum_sayfayi_kaydir(driver, max_adim=30):
 
     Aşağıdaki organik sonuçlar ve #bottomads reklamları ancak scroll'la DOM'a gelir.
     NOT: 'behavior:smooth' KULLANILMAZ — animasyon bitmeden scrollY okununca
-    erken 'dibe vardı' sanılıp duruyordu. Anlık scrollBy + bekleme ile ölç.
+    erken 'dibe vardı' sanılıp duruyordu. Gerçek wheel + bekleme ile ölç.
     """
     try:
         son_y = -1
         durgun = 0
+        gercek = _dokunma_var(driver)
         for _ in range(max_adim):
-            driver.execute_script("window.scrollBy(0, arguments[0]);",
-                                  random.randint(350, 650))
+            if gercek:
+                # gerçek telefon: parmakla kaydır (dokunma olayları + inertia)
+                _adb_kaydir_asagi(getattr(driver, "_adb_yol", None),
+                                  getattr(driver, "_adb_seri", None),
+                                  getattr(driver, "_ekran", None))
+            else:
+                _gercek_scroll(driver, random.randint(350, 650))
             insanca_bekle(0.35, 0.8)   # lazy içerik yüklensin
             y = driver.execute_script(
                 "return Math.round(window.scrollY + window.innerHeight);")
@@ -375,7 +850,7 @@ def cerez_kapat(driver):
         "//button[contains(., 'Kabul et')]",
         "//div[@role='none']//button[2]",
     ]
-    # Çerez penceresi genelde hiç çıkmaz (ncr) -> uzun beklememek için kısa timeout.
+    # Oturum açık profilde çerez penceresi genelde çıkmaz -> kısa timeout.
     # İlk xpath'te 1.2 sn dene; çıkmadıysa kalanları anında (0 bekleme) kontrol et.
     for i, xp in enumerate(xpaths):
         try:
@@ -676,7 +1151,7 @@ def _ziyaret_href(driver, href, etiket, log_cb, gez_dongu=5):
     try:
         driver.switch_to.new_window("tab")
         driver.get(href)
-        insanca_bekle(1.5, 3.0)
+        insanca_bekle(1.5, 3.0, maks=4.5)
         mouse_gezin(driver, dongu=gez_dongu)   # sitede gez
     except Exception as ex:
         _log(log_cb, f"  ! '{etiket}' ziyaret hatası: {str(ex)[:70]}")
@@ -706,14 +1181,29 @@ def _siteyi_gez(driver, hedef, log_cb, etiket, serp_url=None, gez_dongu=5):
     onceki_handles = set(driver.window_handles)
 
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", hedef)
-    ActionChains(driver).move_to_element(hedef).perform()
     insanca_bekle()
-    try:
-        hedef.click()
-    except Exception:
-        driver.execute_script("arguments[0].click();", hedef)
 
-    insanca_bekle(1.5, 3.0)
+    tiklandi = False
+    if _dokunma_var(driver):
+        # gerçek telefon: parmakla dokun (ADB input tap). Işlemezse normal tıklamaya düş.
+        onceki_url = driver.current_url
+        tiklandi = _gercek_tikla(driver, hedef, onceki_handles, onceki_url)
+        if not tiklandi:
+            if getattr(driver, "_dokunma_yok", False):
+                _log(log_cb, "  (adb dokunma engelli/MIUI -> Selenium tıklama kullanılıyor)")
+            else:
+                _log(log_cb, "  (parmak dokunuşu işlemedi, normal tıklamaya geçildi)")
+    if not tiklandi:
+        try:
+            ActionChains(driver).move_to_element(hedef).perform()
+        except Exception:
+            pass
+        try:
+            hedef.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", hedef)
+
+    insanca_bekle(1.5, 3.0, maks=4.5)
 
     # yeni sekme açıldı mı?
     yeni = set(driver.window_handles) - onceki_handles
@@ -765,8 +1255,8 @@ def _yanlis_tikla_don(driver, serp_url, log_cb, kacin=None):
         pass
 
 
-def _reklam_domainleri_topla(driver, log_cb):
-    """SERP'teki TÜM reklam domainlerini çıkar ve LOGLA (listeye ekleme YOK)."""
+def _reklam_domainleri_topla(driver, log_cb, arama=""):
+    """SERP'teki TÜM reklam domainlerini çıkar, LOGLA ve DB'ye KAYDET."""
     bulunan = []
     try:
         for a in _reklam_linkleri(driver):
@@ -780,6 +1270,7 @@ def _reklam_domainleri_topla(driver, log_cb):
         pass
     if bulunan:
         _log(log_cb, f"  Reklam domainleri ({len(bulunan)}): {', '.join(bulunan)}")
+        reklam_domain_kaydet(bulunan, arama, log_cb)   # yerel DB'ye yaz
     else:
         _log(log_cb, "  Sayfada reklam linki bulunamadı.")
     return bulunan
@@ -823,56 +1314,88 @@ def _mobil_emulasyon():
     }
 
 
-def _reklamlari_sirayla_isle(driver, domainler, log_cb, serp_url, iptal_mi,
-                             gez_dongu=5):
-    """Reklamları YUKARIDAN AŞAĞIYA sırayla gez; her birinin domaini listede mi bak.
+def _reklam_haritasi(driver, log_cb=None, arama="", etiket="Tarama"):
+    """Sayfayı en alta kadar süz, TÜM reklamları (domain, href) olarak döndür.
 
-    Akış: kaydır -> ilk reklamı bul -> listede mi? varsa GİR (tıkla-gez-dön), yoksa atla
-          -> sıradaki işlenmemiş reklama geç -> tüm reklamlar bitene kadar tekrar.
-    SERP'e dönünce DOM değişir; işlenenler domain ile takip edilir (tekrar girilmez).
+    Döner: [(domain, href)] DOM sırasıyla (üstten alta), domain başına ilk link.
+    Bulunan domainler DB'ye de yazılır (girilsin girilmesin).
     """
-    liste = set(_temiz_domain(d) for d in domainler)
-    islenmis = set()      # girilen ya da atlanan reklam domainleri
+    konum_popup_kapat(driver)
+    _tum_sayfayi_kaydir(driver)
+    reklamlar = []
+    gorulen = set()
+    for a in _reklam_linkleri(driver):
+        try:
+            href = a.get_attribute("href") or ""
+            dom = _temiz_domain(_href_host(href))
+        except Exception:
+            continue
+        if dom and href and dom not in gorulen:
+            gorulen.add(dom)
+            reklamlar.append((dom, href))
+    reklam_domain_kaydet([d for d, _ in reklamlar], arama, log_cb)
+    _log(log_cb, f"  {etiket}: {len(reklamlar)} reklam bulundu "
+                 f"({', '.join(d for d, _ in reklamlar) or '-'}).")
+    return reklamlar
+
+
+def _reklamlari_sirayla_isle(driver, domainler, log_cb, serp_url, iptal_mi,
+                             gez_dongu=5, arama=""):
+    """Sayfayı süz, tüm reklamları (domain+href) yakala, listeyle kıyasla,
+    eşleşenlere TEK TEK gir.
+
+    ÖNEMLİ: her reklam ziyaretinden sonra SERP yeniden yükleniyor ve Google
+    reklam açık artırmasını TEKRAR çalıştırıyor -> reklam seti değişiyor.
+    Bu yüzden ilk taramaya güvenilmez; her dönüşte sayfa YENİDEN taranır.
+    Aksi halde ilk taramada olmayan (ama sonra çıkan) reklamlar es geçiliyordu.
+    """
+    # liste sırasını koru, tekrarsız
+    liste = []
+    for d in domainler:
+        td = _temiz_domain(d)
+        if td and td not in liste:
+            liste.append(td)
+
+    reklamlar = _reklam_haritasi(driver, log_cb, arama, "İlk tarama")
+
+    def _href_bul(domain):
+        for d, h in reklamlar:
+            if d == domain or d.endswith("." + domain) or domain.endswith("." + d):
+                return h
+        return None
+
+    # === Listeyle kıyasla, eşleşenlere tek tek gir ===
+    # ÖNEMLI: reklama GERÇEK tıklama ile girilir (reklam <a> öğesine click).
+    # Eski yol driver.get(aclk_url) idi -> Google referer'ı + gclid taşınmıyordu,
+    # tıklama jesti yoktu = 'geçersiz tıklama' sinyali. Artık öğeyi tıklıyoruz;
+    # gclid + referer korunur, sonra SERP'e (serp_url) kesin dönülür.
     girilen = 0
-    while True:
+    for sira, domain in enumerate(liste):
         if iptal_mi():
             _log(log_cb, "İptal edildi.")
             break
-        konum_popup_kapat(driver)
-        _tum_sayfayi_kaydir(driver)        # tüm reklamlar (üst+alt) yüklensin
-
-        # sayfadaki reklamları DOM sırasıyla (üstten alta) domainleriyle al, tekrarsız
-        sirali = []
-        gorulen = set()
-        for a in _reklam_linkleri(driver):
-            try:
-                rd = _temiz_domain(_reklam_domain(a.get_attribute("href") or ""))
-            except Exception:
-                rd = ""
-            if rd and rd not in gorulen:
-                gorulen.add(rd)
-                sirali.append(rd)
-
-        # ilk İŞLENMEMİŞ reklamı seç (sıradaki)
-        rd = next((d for d in sirali if d not in islenmis), None)
-        if rd is None:
-            break                          # tüm reklamlar işlendi
-
-        islenmis.add(rd)
-        if rd in liste:
-            hedef = _reklam_link_bul(driver, rd)
-            if hedef:
-                _log(log_cb, f"  ✓ reklam listende VAR: {rd} -> giriliyor")
-                _siteyi_gez(driver, hedef, log_cb, f"[Ad] {rd}", serp_url,
-                            gez_dongu=gez_dongu)
-                girilen += 1
-            else:
-                _log(log_cb, f"  ! '{rd}' reklamı tekrar bulunamadı, atlandı.")
+        # İlk domain hariç: SERP yeniden yüklendi -> reklamlar değişmiş olabilir
+        if sira > 0 and girilen > 0:
+            reklamlar = _reklam_haritasi(driver, log_cb, arama, "Yeniden tarama")
+        href = _href_bul(domain)
+        if not href:
+            _log(log_cb, f"  – '{domain}' bu sayfada reklamda yok, atlandı.")
+            continue
+        # reklam öğesini TAZE bul (SERP dönüşlerinde DOM yenilenir)
+        hedef = _reklam_link_bul(driver, domain)
+        if not hedef:
+            _tum_sayfayi_kaydir(driver)             # alt reklamlar DOM'a gelsin
+            hedef = _reklam_link_bul(driver, domain)
+        if hedef:
+            _log(log_cb, f"  ✓ '{domain}' reklamda VAR -> tıklanıyor (gerçek tık)")
+            _siteyi_gez(driver, hedef, log_cb, f"[Ad] {domain}", serp_url, gez_dongu)
         else:
-            _log(log_cb, f"  – reklam listende yok: {rd} -> atlandı")
+            # öğe bulunamadı (nad.) -> son çare doğrudan aç
+            _log(log_cb, f"  ✓ '{domain}' -> giriliyor (öğe yok, doğrudan)")
+            _ziyaret_href(driver, href, f"[Ad] {domain}", log_cb, gez_dongu)
+        girilen += 1
 
-    _log(log_cb, f"  Reklam tarama bitti: {girilen} listedeki reklama girildi, "
-                 f"{len(islenmis)} reklam kontrol edildi.")
+    _log(log_cb, f"  Liste tarama bitti: {girilen}/{len(liste)} siteye girildi.")
     return girilen
 
 
@@ -902,6 +1425,9 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
     # Her çalışmada benzersiz profil -> kilit/çakışma yok (DevToolsActivePort hatası)
     profil = tempfile.mkdtemp(prefix="selenium_chrome_")
 
+    # PATH'teki eski chromedriver'ı yok say -> Selenium Manager doğrusunu indirsin
+    _pathteki_chromedriver_gizle(log_cb)
+
     def _ortak_arg(op):
         op.add_argument(f"--user-data-dir={profil}")
         op.add_argument("--no-first-run")
@@ -920,22 +1446,78 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
         # --- GERÇEK telefon: ADB ile bağlı cihazdaki Chrome'u sür (androidPackage) ---
         # chromedriver, cihazın Chrome sürümüne uygun olmalı. Selenium Manager indirir.
         # chromedriver adb'yi PATH'ten bulur -> adb klasörünü PATH'e ekle.
+        _adb_yol = adb_bul()
         try:
-            adb_dir = os.path.dirname(adb_bul())
+            adb_dir = os.path.dirname(_adb_yol)
             if adb_dir and adb_dir not in os.environ.get("PATH", ""):
                 os.environ["PATH"] = adb_dir + os.pathsep + os.environ.get("PATH", "")
         except Exception:
             pass
+        # Chrome açılmadan önce telefonu hazırla: uyandır, kilit aç, mobil veri (operatör IP)
+        telefon_hazirla(_adb_yol, cihaz_seri, mobil_veri=True, log_cb=log_cb)
         op = webdriver.ChromeOptions()
         op.add_experimental_option("androidPackage", "com.android.chrome")
+        # Oturum/çerez KORUNMAZ: Chrome'u chromedriver başlatır ve açılışta
+        # veriyi temizler (temiz profil). Kalıcı profilde Google kişiselleştirmesi
+        # yüzünden aramalarda reklam çıkmıyordu -> androidUseRunningApp kullanılmaz.
         if cihaz_seri:
             op.add_experimental_option("androidDeviceSerial", cihaz_seri)
         op.add_argument("--disable-blink-features=AutomationControlled")
         op.add_experimental_option("excludeSwitches", ["enable-automation"])
         op.add_argument("--lang=tr-TR")
+        # Telefondaki Chrome sürümünü oku -> AYNI major'da chromedriver indir.
+        # (Selenium Manager PC'deki Chrome'a göre seçer -> telefonla uyuşmaz!)
+        tel_major = telefon_chrome_major(_adb_yol, cihaz_seri)
+        surucu = _chromedriver_indir(tel_major, log_cb) if tel_major else None
         _log(log_cb, f"Telefon Chrome'u açılıyor (ADB)... "
-                     f"cihaz: {cihaz_seri or 'otomatik'}, arama: '{arama}'")
-        driver = webdriver.Chrome(options=op)
+                     f"cihaz: {cihaz_seri or 'otomatik'}, "
+                     f"telefon Chrome: {tel_major or '?'}, arama: '{arama}'")
+        if not surucu:
+            _log(log_cb, "Uyarı: telefon Chrome sürümü/driver alınamadı, "
+                         "Selenium Manager deneniyor (sürüm uyuşmayabilir).")
+
+        def _yeni_driver(_op):
+            if surucu:
+                return webdriver.Chrome(service=Service(executable_path=surucu),
+                                        options=_op)
+            return webdriver.Chrome(options=_op)
+
+        # Chrome'u chromedriver başlatır. Önce eski oturumu düşür (takılı kalan
+        # Chrome süreci "device busy"/eski sekme sorunları yaratıyor).
+        _telefon_chrome_durdur(_adb_yol, cihaz_seri, log_cb)
+        try:
+            driver = _yeni_driver(op)
+        except Exception as ex:
+            m = str(ex).lower()
+            if not any(s in m for s in ("not running", "unable to discover open pages",
+                                        "no such window", "chrome not reachable",
+                                        "devtools", "timed out")):
+                raise
+            _log(log_cb, "Telefon Chrome'u açılamadı, süreç düşürülüp tekrar denenecek...")
+            _telefon_chrome_durdur(_adb_yol, cihaz_seri, log_cb, bekle=4)
+            driver = _yeni_driver(op)
+        # Gerçek dokunma katmanı için ADB bağlamını driver'a iliştir
+        driver._gercek = True
+        driver._adb_yol = _adb_yol
+        driver._adb_seri = cihaz_seri
+        try:
+            driver._ekran = _adb_ekran_boyut(_adb_yol, cihaz_seri)
+        except Exception:
+            driver._ekran = (1080, 2400)
+        # MIUI/HyperOS dokunma enjeksiyonu testi (keyevent 0 = zararsız).
+        # Yasaksa tüm jestler baştan Selenium/JS'e yönlenir, takılma olmaz.
+        try:
+            test = _adb(_adb_yol, "shell", "input", "keyevent", "0",
+                        seri=cihaz_seri, sn=8)
+            if test and ("Exception" in test or "INJECT_EVENTS" in test
+                         or "Error" in test):
+                driver._dokunma_yok = True
+                _log(log_cb, "Uyarı: telefon adb dokunma enjeksiyonunu engelliyor "
+                             "(MIUI güvenlik). Selenium tıklama/kaydırma kullanılacak. "
+                             "Gerçek parmak jesti istersen: Geliştirici seçenekleri > "
+                             "'USB hata ayıklama (Güvenlik ayarları)' aç.")
+        except Exception:
+            pass
     elif uc is not None:
         # undetected-chromedriver: Google bot tespitini ciddi azaltır.
         # NOT: uc kendi profilini yönetir -> custom --user-data-dir / --no-sandbox VERME.
@@ -1007,7 +1589,7 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
         except Exception:
             pass
     else:
-        _stealth_uygula(driver)
+        _stealth_uygula(driver, mobil=mobil)
 
     # Konum iznini CDP ile REDDET (popup hiç çıkmasın). Her modda denenir.
     for _kok in ("https://www.google.com", "https://www.google.com.tr"):
@@ -1022,7 +1604,10 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
 
     try:
         # internet yoksa (uçak modu yeni kapandıysa) bekle-tekrar dene
-        _ag_bekle_ve_ac(driver, "https://www.google.com/ncr", log_cb, iptal_mi)
+        # NOT: '/ncr' (No Country Redirect) KULLANILMAZ. Google'ı global/ABD
+        # google.com'a sabitliyordu -> arayüz İngilizce + TR yerel reklamlar
+        # açık artırmaya girmiyordu. Doğrudan .com.tr + hl/gl=tr açılır.
+        _ag_bekle_ve_ac(driver, GOOGLE_URL, log_cb, iptal_mi)
         if iptal_mi():
             return
         # sayfa yükü sonrası KISA sabit bekleme (insanca_bekle'nin uzun kuyruğu yok)
@@ -1073,45 +1658,45 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
         if konum_popup_kapat(driver):
             _log(log_cb, "  Konum izni penceresi kapatıldı.")
         serp_url = driver.current_url   # sonuç sayfasına kesin dönmek için
-        mouse_gezin(driver, dongu=2)
+        mouse_gezin(driver, dongu=1)
 
         domainler = [d.strip() for d in hedef_site.split(",") if d.strip()]
+        # DB'de kayıtlı (önceki aramalarda bulunan) reklam domainlerini de HEDEF yap.
+        # Kullanıcı listesi önce, sonra DB'dekiler (tekrarsız). Kara liste zaten yazılmıyor.
+        try:
+            # SADECE bu aramada bulunmuş domainler + elle eklenenler hedeflenir
+            for d in hedef_domainler_db(arama):
+                if d and d not in domainler:
+                    domainler.append(d)
+        except Exception:
+            pass
+        if domainler:
+            _log(log_cb, f"  Hedef site sayısı: {len(domainler)} "
+                         f"(liste + DB birleşik).")
 
         if sadece_reklam:
-            # --- SADECE reklam (Ad/Sponsorlu) linklerini iyice tara ---
-            mouse_gezin(driver, dongu=1)
-            _tum_sayfayi_kaydir(driver)    # üst+alt tüm reklamlar yüklensin
-            rek = _reklam_linkleri(driver)
-            rek_domainler = []
-            for a in rek:
-                try:
-                    rek_domainler.append(_reklam_domain(a.get_attribute("href")))
-                except Exception:
-                    pass
-            _log(log_cb, f"  {len(rek)} reklam linki bulundu. "
-                         f"Reklam siteleri: {', '.join(sorted(set(d for d in rek_domainler if d))) or '-'}")
+            # --- SADECE reklam (Ad/Sponsorlu) ---
             if domainler:
-                # Reklamları YUKARIDAN AŞAĞIYA sırayla gez; listende olana gir, olmayanı atla
-                _reklamlari_sirayla_isle(driver, domainler, log_cb, serp_url, iptal_mi)
+                # Tarama + listeyle kıyas + tek tek gir (hepsi fonksiyon içinde).
+                # Her SERP dönüşünde reklamlar yeniden taranır.
+                _reklamlari_sirayla_isle(driver, domainler, log_cb, serp_url,
+                                         iptal_mi, arama=arama)
             else:
-                # site belirtilmemiş: ilk N reklamı tıkla (back sonrası yeniden çek)
-                for i in range(tiklama):
+                # site yok: sayfayı süz, ilk N reklamı gir (yeni sekmede)
+                yakalanan = _reklam_haritasi(driver, log_cb, arama, "Tarama")
+                for i in range(min(tiklama, len(yakalanan))):
                     if iptal_mi():
                         break
-                    rekler = _reklam_linkleri(driver)
-                    if i >= len(rekler):
-                        break
-                    hedef = rekler[i]
-                    etiket = _temiz_domain(hedef.get_attribute("href") or "")[:50]
-                    _siteyi_gez(driver, hedef, log_cb, f"[Ad] {etiket}", serp_url)
+                    dom, href = yakalanan[i]
+                    _ziyaret_href(driver, href, f"[Ad] {dom[:50]}", log_cb)
         elif domainler:
             # --- Hedef site(ler): SERP'teki gerçek sonuca TIKLA ---
             # Her domaini SERP'te taze bul, tıkla, gez, SERP'e dön, sıradakine geç.
             mouse_gezin(driver, dongu=1)
             konum_popup_kapat(driver)     # geç çıkan konum penceresini kapat
             _tum_sayfayi_kaydir(driver)   # tüm sonuç + alt reklamlar yüklensin
-            # SERP'teki reklam domainlerini sadece logla (listeye ekleme yok)
-            _reklam_domainleri_topla(driver, log_cb)
+            # SERP'teki reklam domainlerini logla + DB'ye kaydet
+            _reklam_domainleri_topla(driver, log_cb, arama)
             # teşhis: sayfadaki organik host'lar (hedef tutmazsa neden görülür)
             _log(log_cb, f"  Organik sonuç host'ları: "
                          f"{', '.join(_gorunur_hostlar(driver)) or '-'}")
@@ -1156,6 +1741,9 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
         _log(log_cb, f"'{arama}' bitti.")
 
     finally:
+        if gercek_telefon and driver is not None and not detach:
+            # gerçek telefon: quit() sekmeleri kapatmaz -> önce sekmeleri kapat
+            _telefon_sekmeleri_kapat(driver, log_cb)
         if not detach:
             try:
                 driver.quit()
@@ -1204,14 +1792,80 @@ def adb_bul():
     return "adb"
 
 
+# Windows'ta adb her çağrıda konsol (siyah pencere) açmasın -> CREATE_NO_WINDOW
+_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+
 def _adb(adb_yol, *args, seri=None, sn=15):
     """seri verilirse '-s <seri>' ile o cihaza yönlendir."""
     komut = [adb_yol]
     if seri:
         komut += ["-s", seri]
     komut += list(args)
-    r = subprocess.run(komut, capture_output=True, text=True, timeout=sn)
+    r = subprocess.run(komut, capture_output=True, text=True, timeout=sn,
+                       creationflags=_NO_WINDOW)
     return (r.stdout + r.stderr).strip()
+
+
+def telefon_chrome_major(adb_yol=None, seri=None):
+    """Telefondaki Chrome'un ana sürüm numarası (int). Bulamazsa None."""
+    adb_yol = adb_yol or adb_bul()
+    try:
+        cikti = _adb(adb_yol, "shell", "dumpsys", "package", "com.android.chrome",
+                     seri=seri, sn=20) or ""
+        for satir in cikti.splitlines():
+            satir = satir.strip()
+            if satir.startswith("versionName="):
+                return int(satir.split("=", 1)[1].split(".")[0])
+    except Exception:
+        pass
+    return None
+
+
+def _chromedriver_indir(major, log_cb=None):
+    """Verilen Chrome major sürümüne uygun chromedriver.exe indir, yolu döndür.
+    %LOCALAPPDATA%\\GoogleBot\\chromedriver\\<major>\\ altına cache'ler.
+    İndirilemezse None (Selenium Manager'a düşülür)."""
+    import io
+    import json
+    import zipfile
+    import urllib.request
+
+    kok = os.path.join(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
+                       "GoogleBot", "chromedriver", str(major))
+    hedef = os.path.join(kok, "chromedriver.exe")
+    if os.path.isfile(hedef):
+        return hedef
+    try:
+        if major >= 115:
+            # Chrome for Testing (yeni sürümler)
+            url_v = f"https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_{major}"
+            with urllib.request.urlopen(url_v, timeout=30) as r:
+                surum = r.read().decode().strip()
+            url_zip = (f"https://storage.googleapis.com/chrome-for-testing-public/"
+                       f"{surum}/win64/chromedriver-win64.zip")
+        else:
+            # Eski depo (Chrome <= 114)
+            url_v = f"https://chromedriver.storage.googleapis.com/LATEST_RELEASE_{major}"
+            with urllib.request.urlopen(url_v, timeout=30) as r:
+                surum = r.read().decode().strip()
+            url_zip = f"https://chromedriver.storage.googleapis.com/{surum}/chromedriver_win32.zip"
+        _log(log_cb, f"chromedriver {surum} indiriliyor (Chrome {major} için)...")
+        with urllib.request.urlopen(url_zip, timeout=120) as r:
+            veri = r.read()
+        os.makedirs(kok, exist_ok=True)
+        with zipfile.ZipFile(io.BytesIO(veri)) as z:
+            for ad in z.namelist():
+                if ad.endswith("chromedriver.exe"):
+                    with z.open(ad) as kaynak, open(hedef, "wb") as cikis:
+                        shutil.copyfileobj(kaynak, cikis)
+                    break
+        if os.path.isfile(hedef):
+            _log(log_cb, f"chromedriver hazır: {hedef}")
+            return hedef
+    except Exception as ex:
+        _log(log_cb, f"chromedriver indirilemedi ({str(ex)[:80]})")
+    return None
 
 
 def adb_cihazlar(adb_yol=None):
@@ -1245,6 +1899,163 @@ def adb_cihaz_var(adb_yol, seri=None):
         if seri is None or c["seri"] == seri:
             return True
     return False
+
+
+# ---------------- Gerçek dokunma (ADB input) ----------------
+# Gerçek telefonda kaydırmayı JS (window.scrollBy) yerine PARMAK hareketiyle yap.
+# JS scroll: touchstart/move/end ÜRETMEZ + scrollY anlık zıplar -> Google "programatik" der.
+# ADB swipe: gerçek dokunma olayları + inertia (kayma) -> gerçek kullanıcı sinyali.
+
+def _adb_ekran_boyut(adb_yol=None, seri=None):
+    """Cihaz ekran çözünürlüğü (genişlik, yükseklik) piksel. Bulamazsa (1080, 2400)."""
+    adb_yol = adb_yol or adb_bul()
+    try:
+        cikti = _adb(adb_yol, "shell", "wm", "size", seri=seri, sn=8) or ""
+        # 'Physical size: 1080x2400' ve varsa 'Override size: ...'; sonuncuyu (geçerli) al
+        son = None
+        for satir in cikti.splitlines():
+            if "size:" in satir and "x" in satir:
+                boyut = satir.split(":", 1)[1].strip()
+                if "x" in boyut:
+                    g, y = boyut.split("x", 1)
+                    son = (int(g.strip()), int(y.strip()))
+        if son:
+            return son
+    except Exception:
+        pass
+    return 1080, 2400
+
+
+def _adb_swipe(x1, y1, x2, y2, sure_ms=300, adb_yol=None, seri=None):
+    """Ekranda gerçek parmak kaydırması (input swipe)."""
+    adb_yol = adb_yol or adb_bul()
+    _adb(adb_yol, "shell", "input", "swipe",
+         str(int(x1)), str(int(y1)), str(int(x2)), str(int(y2)), str(int(sure_ms)),
+         seri=seri, sn=10)
+
+
+def _adb_kaydir_asagi(adb_yol=None, seri=None, ekran=None):
+    """Sayfayı bir tık AŞAĞI kaydır: ekran ortasında YUKARI yönlü gerçek swipe."""
+    w, h = ekran or _adb_ekran_boyut(adb_yol, seri)
+    cx = int(w * random.uniform(0.42, 0.58))
+    y1 = int(h * random.uniform(0.68, 0.78))          # parmak aşağıdan başlar
+    y2 = int(h * random.uniform(0.26, 0.36))          # yukarı sürükler = sayfa aşağı iner
+    _adb_swipe(cx, y1, cx + random.randint(-25, 25), y2,
+               random.randint(240, 460), adb_yol, seri)
+
+
+def _adb_tap(x, y, adb_yol=None, seri=None):
+    """Ekranda gerçek parmak dokunuşu (input tap). x,y = cihaz pikseli.
+    adb çıktısını döndürür (MIUI SecurityException tespiti için)."""
+    adb_yol = adb_yol or adb_bul()
+    return _adb(adb_yol, "shell", "input", "tap", str(int(x)), str(int(y)),
+                seri=seri, sn=8)
+
+
+def _gercek_tikla(driver, hedef, onceki_handles, onceki_url):
+    """Öğeyi GERÇEK parmak dokunuşuyla (ADB input tap) tıkla.
+
+    CSS-px öğe konumunu cihaz pikseline çevirir:
+      dev_x = cx * dpr
+      dev_y = cy * dpr + ust_ofset   (ust_ofset = durum çubuğu + adres çubuğu)
+      ust_ofset = ekran_yukseklik - innerHeight*dpr  (adres çubuğu durumuna göre kendini düzeltir)
+    Dokunuş navigasyon (URL değişimi / yeni sekme) yaratırsa True.
+    Öğe görünür değilse ya da dokunuş bir şey açmazsa False -> çağıran normal tıklamaya düşer.
+    """
+    try:
+        d = driver.execute_script(
+            "const r=arguments[0].getBoundingClientRect();"
+            "return {cx:r.left+r.width/2, cy:r.top+r.height/2,"
+            " ih:window.innerHeight, dpr:window.devicePixelRatio||2};", hedef)
+        if not d or d["cy"] < 0 or d["cy"] > d["ih"]:
+            return False   # ekran dışında -> koordinat güvenilmez, normal tıkla
+        w, h = getattr(driver, "_ekran", (1080, 2400))
+        dpr = d["dpr"] or 2
+        ust_ofset = max(0, h - d["ih"] * dpr)
+        x = min(max(int(d["cx"] * dpr), 2), w - 2)
+        y = min(max(int(d["cy"] * dpr + ust_ofset), 2), h - 2)
+        cikti = _adb_tap(x, y, getattr(driver, "_adb_yol", None),
+                         getattr(driver, "_adb_seri", None))
+        if cikti and ("Exception" in cikti or "INJECT_EVENTS" in cikti
+                      or "Error" in cikti):
+            # MIUI: input enjeksiyonu yasak -> bir daha deneme, hep Selenium kullan
+            driver._dokunma_yok = True
+            return False
+        # dokunuş işe yaradı mı? navigasyon / yeni sekme bekle
+        for _ in range(16):
+            time.sleep(0.25)
+            try:
+                if set(driver.window_handles) != onceki_handles:
+                    return True
+                if driver.current_url != onceki_url:
+                    return True
+            except Exception:
+                return True   # sekme kapandı/değişti = tıklama işledi
+        return False
+    except Exception:
+        return False
+
+
+def _telefon_chrome_durdur(adb_yol=None, seri=None, log_cb=None, bekle=2):
+    """Telefondaki Chrome sürecini düşür (force-stop).
+
+    Chrome'u chromedriver başlatır ve androidUseRunningApp verilmediği için
+    veri dizinini KENDİ temizler (her koşu temiz profil, çerez/oturum taşınmaz).
+    Burada sadece takılı kalan eski süreç kapatılır; 'pm clear' çağırmıyoruz,
+    onu chromedriver'a bırakıyoruz (aksi halde ilk açılış sihirbazı çıkabilir).
+    """
+    adb_yol = adb_yol or adb_bul()
+    try:
+        _adb(adb_yol, "shell", "am", "force-stop", "com.android.chrome",
+             seri=seri, sn=15)
+        time.sleep(bekle)
+        _log(log_cb, "Telefonda eski Chrome süreci kapatıldı (temiz başlangıç).")
+    except Exception as ex:
+        _log(log_cb, f"Telefon Chrome kapatma uyarısı: {str(ex)[:60]}")
+
+
+def _telefon_sekmeleri_kapat(driver, log_cb=None):
+    """Çıkmadan önce telefondaki Chrome sekmelerini kapat.
+
+    quit() bağlantıyı koparmadan önce gezilen sayfalar/SERP kapatılır; ekranda
+    açık sayfa kalmaz. Veri zaten sonraki koşuda 'pm clear' ile silinir.
+    """
+    try:
+        handles = list(driver.window_handles)
+    except Exception:
+        return
+    for h in handles:
+        try:
+            driver.switch_to.window(h)
+            driver.close()
+        except Exception:
+            pass
+    if handles:
+        _log(log_cb, f"Telefonda {len(handles)} sekme kapatıldı.")
+
+
+def telefon_hazirla(adb_yol=None, seri=None, mobil_veri=True, log_cb=None):
+    """Gerçek telefonu sürüşe hazırla: uyandır, kilidi aç, uyanık tut, mobil veriye geç.
+
+    mobil_veri=True: Wi-Fi kapat + hücresel veri aç -> operatör (gerçek mobil) IP'si.
+      NOT: ADB USB üzerinden olmalı. Kablosuz ADB'de Wi-Fi kapanınca bağlantı düşer.
+    """
+    adb_yol = adb_yol or adb_bul()
+    try:
+        w, h = _adb_ekran_boyut(adb_yol, seri)
+        _adb(adb_yol, "shell", "input", "keyevent", "KEYCODE_WAKEUP", seri=seri, sn=8)
+        time.sleep(0.4)
+        # kilit ekranını yukarı kaydır (PIN yoksa açılır). Zaten açıksa zararsız.
+        _adb_swipe(w // 2, int(h * 0.80), w // 2, int(h * 0.20), 250, adb_yol, seri)
+        # sürüş boyunca ekran uyumasın
+        _adb(adb_yol, "shell", "svc", "power", "stayon", "true", seri=seri, sn=8)
+        if mobil_veri:
+            _adb(adb_yol, "shell", "svc", "wifi", "disable", seri=seri, sn=8)
+            _adb(adb_yol, "shell", "svc", "data", "enable", seri=seri, sn=8)
+        _log(log_cb, "Telefon hazır (uyanık, kilit açık"
+                     + (", mobil veri/operatör IP" if mobil_veri else "") + ").")
+    except Exception as ex:
+        _log(log_cb, f"Telefon hazırlama uyarısı: {str(ex)[:60]}")
 
 
 def ucak_modu(ac=True, adb_yol=None, seri=None, log_cb=None):
