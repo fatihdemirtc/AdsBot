@@ -20,3 +20,6 @@ hata_log.txt
 
 # Selenium / uc profilleri
 selenium_chrome_*/
+
+# Yerel veritabanı (bulunan reklam siteleri - gizli)
+reklam_domainleri.db

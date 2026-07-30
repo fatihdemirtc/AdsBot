@@ -7,6 +7,8 @@ Aramaları + hedef siteleri yönet, ayarla, çalıştır.
 import os
 import sys
 import json
+import time
+import random
 import threading
 import urllib.request
 import tkinter as tk
@@ -136,6 +138,9 @@ class Panel:
         self._konsol()
 
         self._tabloyu_doldur(yukle())
+        self._db_yenile()          # bulunan siteler (DB) tablosunu doldur
+        self._kara_yenile()        # kara liste (DB'ye kaydedilmeyenler)
+        self._db_oto_yenile()      # çalışırken canlı tazele
         kok.protocol("WM_DELETE_WINDOW", self.kapat)
 
     def _tekerle_kaydir(self, e):
@@ -207,24 +212,23 @@ class Panel:
                     command=self.ip_yenile).pack(side="left", padx=(6, 0))
         self.ip_yenile()
 
-    # ---------- sol: tablo + form ----------
+    # ---------- sol: arama listesi + bulunan siteler (DB) ----------
     def _sol_tablo(self, usta):
         sol = tk.Frame(usta, bg=BG)
         sol.pack(side="left", fill="both", expand=True, padx=(0, 14))
 
+        # === Arama Listesi kartı (sadece arama kelimesi + tıklama) ===
         dis, ic = self._kart(sol, "Arama Listesi")
-        dis.pack(fill="both", expand=True)
+        dis.pack(fill="x")
 
         tcer = tk.Frame(ic, bg=PANEL)
         tcer.pack(fill="x")
-        self.tablo = ttk.Treeview(tcer, style="Trv.Treeview", height=6,
-                                  columns=("arama", "site", "tik"),
+        self.tablo = ttk.Treeview(tcer, style="Trv.Treeview", height=3,
+                                  columns=("arama", "tik"),
                                   show="headings", selectmode="browse")
         self.tablo.heading("arama", text="ARAMA KELİMESİ")
-        self.tablo.heading("site", text="HEDEF SİTE")
         self.tablo.heading("tik", text="TIK")
-        self.tablo.column("arama", width=240, anchor="w")
-        self.tablo.column("site", width=170, anchor="w")
+        self.tablo.column("arama", width=320, anchor="w")
         self.tablo.column("tik", width=45, anchor="center")
         self.tablo.tag_configure("tek", background=PANEL)
         self.tablo.tag_configure("cift", background="#223049")
@@ -234,42 +238,13 @@ class Panel:
         self.tablo.configure(yscrollcommand=sb.set)
         self.tablo.bind("<<TreeviewSelect>>", self._secimi_forma)
 
-        # form
         form = tk.Frame(ic, bg=PANEL)
-        form.pack(fill="both", expand=True, pady=(12, 0))
-        form.rowconfigure(3, weight=1)
-
+        form.pack(fill="x", pady=(12, 0))
+        form.columnconfigure(0, weight=1)
         self.f_arama = self._giris(form, "Arama kelimesi", 0)
 
-        # --- Hedef site listesi ---
-        tk.Label(form, text="Hedef siteler (boş = ilk N sonuç)", bg=PANEL, fg=SOLUK,
-                 font=("Segoe UI", 9)).grid(row=2, column=0, sticky="w", pady=(6, 2))
-        sblok = tk.Frame(form, bg=PANEL)
-        sblok.grid(row=3, column=0, sticky="nswe")
-
-        sgir = tk.Frame(sblok, bg=PANEL)
-        sgir.pack(fill="x")
-        self.f_site_giris = tk.Entry(sgir, bg=PANEL2, fg=METIN, relief="flat",
-                                     insertbackground=METIN, font=("Segoe UI", 10),
-                                     highlightthickness=1, highlightbackground=KENAR,
-                                     highlightcolor=ACCENT)
-        self.f_site_giris.pack(side="left", fill="x", expand=True, ipady=4)
-        self.f_site_giris.bind("<Return>", lambda e: self._site_ekle())
-        HoverButton(sgir, ACCENT, ACCENT_H, text="+ Site",
-                    command=self._site_ekle).pack(side="left", padx=(6, 0))
-        HoverButton(sgir, KIRMIZI, KIRMIZI_H, text="−",
-                    command=self._site_sil).pack(side="left", padx=(6, 0))
-
-        self.site_liste = tk.Listbox(sblok, height=12, bg=PANEL2, fg=METIN,
-                                     selectbackground=ACCENT, selectforeground="white",
-                                     relief="flat", highlightthickness=1,
-                                     highlightbackground=KENAR, font=("Segoe UI", 10),
-                                     activestyle="none")
-        self.site_liste.pack(fill="both", expand=True, pady=(6, 0))
-
         satir = tk.Frame(form, bg=PANEL)
-        satir.grid(row=4, column=0, sticky="we", pady=(8, 0))
-        form.columnconfigure(0, weight=1)
+        satir.grid(row=2, column=0, sticky="we", pady=(8, 0))
         tk.Label(satir, text="Tıklama:", bg=PANEL, fg=SOLUK,
                  font=("Segoe UI", 9)).pack(side="left")
         self.f_tik = tk.IntVar(value=3)
@@ -277,7 +252,6 @@ class Panel:
                    bg=PANEL2, fg=METIN, buttonbackground=PANEL2, relief="flat",
                    insertbackground=METIN, highlightthickness=1,
                    highlightbackground=KENAR).pack(side="left", padx=(6, 16))
-
         HoverButton(satir, ACCENT, ACCENT_H, text="+ Ekle",
                     command=self.ekle).pack(side="left")
         HoverButton(satir, PANEL2, KENAR, text="Güncelle",
@@ -286,6 +260,98 @@ class Panel:
                     command=self.sil).pack(side="left")
         HoverButton(satir, PANEL2, KENAR, text="Temizle",
                     command=self._formu_temizle).pack(side="left", padx=6)
+
+        # === Hedef Siteler (Bulunan • DB) kartı ===
+        ddis, dic = self._kart(sol, "Hedef Siteler  •  Bulunan (DB)")
+        ddis.pack(fill="both", expand=True, pady=(14, 0))
+
+        tk.Label(dic, text="Aramalarda bulunan reklam siteleri buraya otomatik "
+                 "kaydedilir ve hedef olarak kullanılır. Elle de ekleyebilirsin.",
+                 bg=PANEL, fg=SOLUK, font=("Segoe UI", 8), anchor="w",
+                 justify="left", wraplength=470).pack(fill="x", pady=(0, 8))
+
+        dtcer = tk.Frame(dic, bg=PANEL)
+        dtcer.pack(fill="both", expand=True)
+        self.db_tablo = ttk.Treeview(dtcer, style="Trv.Treeview", height=5,
+                                     columns=("domain", "gor", "arama", "son"),
+                                     show="headings", selectmode="browse")
+        self.db_tablo.heading("domain", text="SİTE (DOMAIN)")
+        self.db_tablo.heading("gor", text="GÖR")
+        self.db_tablo.heading("arama", text="ARAMA")
+        self.db_tablo.heading("son", text="SON GÖRÜLME")
+        self.db_tablo.column("domain", width=205, anchor="w")
+        self.db_tablo.column("gor", width=42, anchor="center")
+        self.db_tablo.column("arama", width=140, anchor="w")
+        self.db_tablo.column("son", width=135, anchor="w")
+        self.db_tablo.tag_configure("tek", background=PANEL)
+        self.db_tablo.tag_configure("cift", background="#223049")
+        self.db_tablo.pack(side="left", fill="both", expand=True)
+        dsb = ttk.Scrollbar(dtcer, orient="vertical", command=self.db_tablo.yview)
+        dsb.pack(side="right", fill="y")
+        self.db_tablo.configure(yscrollcommand=dsb.set)
+
+        dgir = tk.Frame(dic, bg=PANEL)
+        dgir.pack(fill="x", pady=(8, 0))
+        self.f_db_giris = tk.Entry(dgir, bg=PANEL2, fg=METIN, relief="flat",
+                                   insertbackground=METIN, font=("Segoe UI", 10),
+                                   highlightthickness=1, highlightbackground=KENAR,
+                                   highlightcolor=ACCENT)
+        self.f_db_giris.pack(side="left", fill="x", expand=True, ipady=4)
+        self.f_db_giris.bind("<Return>", lambda e: self._db_ekle())
+        HoverButton(dgir, ACCENT, ACCENT_H, text="+ DB'ye Ekle",
+                    command=self._db_ekle).pack(side="left", padx=(6, 0))
+        HoverButton(dgir, KIRMIZI, KIRMIZI_H, text="Sil",
+                    command=self._db_sil).pack(side="left", padx=(6, 0))
+        HoverButton(dgir, PANEL2, KENAR, text="⟳ Yenile",
+                    command=self._db_yenile).pack(side="left", padx=(6, 0))
+        self.db_lbl = tk.Label(dgir, text="0 site", bg=PANEL, fg=SOLUK,
+                               font=("Segoe UI", 8))
+        self.db_lbl.pack(side="left", padx=(8, 0))
+
+        # === Kara Liste (DB'ye kaydedilmeyenler) kartı ===
+        kdis, kic = self._kart(sol, "Kara Liste  •  DB'ye Kaydedilmeyenler")
+        kdis.pack(fill="x", pady=(14, 0))
+
+        tk.Label(kic, text="Buradaki domainler (alt alanlarıyla birlikte) asla "
+                 "DB'ye kaydedilmez. Eklediğinde DB'deki mevcut kayıtları da "
+                 "silinir.", bg=PANEL, fg=SOLUK, font=("Segoe UI", 8),
+                 anchor="w", justify="left", wraplength=470).pack(fill="x",
+                                                                  pady=(0, 8))
+
+        ktcer = tk.Frame(kic, bg=PANEL)
+        ktcer.pack(fill="x")
+        self.kara_tablo = ttk.Treeview(ktcer, style="Trv.Treeview", height=4,
+                                       columns=("domain", "eklenme"),
+                                       show="headings", selectmode="browse")
+        self.kara_tablo.heading("domain", text="DOMAIN")
+        self.kara_tablo.heading("eklenme", text="EKLENME")
+        self.kara_tablo.column("domain", width=290, anchor="w")
+        self.kara_tablo.column("eklenme", width=150, anchor="w")
+        self.kara_tablo.tag_configure("tek", background=PANEL)
+        self.kara_tablo.tag_configure("cift", background="#223049")
+        self.kara_tablo.pack(side="left", fill="x", expand=True)
+        ksb = ttk.Scrollbar(ktcer, orient="vertical",
+                            command=self.kara_tablo.yview)
+        ksb.pack(side="right", fill="y")
+        self.kara_tablo.configure(yscrollcommand=ksb.set)
+
+        kgir = tk.Frame(kic, bg=PANEL)
+        kgir.pack(fill="x", pady=(8, 0))
+        self.f_kara_giris = tk.Entry(kgir, bg=PANEL2, fg=METIN, relief="flat",
+                                     insertbackground=METIN,
+                                     font=("Segoe UI", 10),
+                                     highlightthickness=1,
+                                     highlightbackground=KENAR,
+                                     highlightcolor=ACCENT)
+        self.f_kara_giris.pack(side="left", fill="x", expand=True, ipady=4)
+        self.f_kara_giris.bind("<Return>", lambda e: self._kara_ekle())
+        HoverButton(kgir, ACCENT, ACCENT_H, text="+ Ekle",
+                    command=self._kara_ekle).pack(side="left", padx=(6, 0))
+        HoverButton(kgir, KIRMIZI, KIRMIZI_H, text="Sil",
+                    command=self._kara_sil).pack(side="left", padx=(6, 0))
+        self.kara_lbl = tk.Label(kgir, text="0 domain", bg=PANEL, fg=SOLUK,
+                                 font=("Segoe UI", 8))
+        self.kara_lbl.pack(side="left", padx=(8, 0))
 
     def _giris(self, usta, etiket, satir):
         tk.Label(usta, text=etiket, bg=PANEL, fg=SOLUK,
@@ -307,13 +373,7 @@ class Panel:
         dis, ic = self._kart(sag, "Ayarlar")
         dis.pack(fill="x")
 
-        self.tekrar = self._ayar_spin(ic, "Tüm listeyi tekrar (kez)", 1, 1, 1000)
-
-        self.sonsuz_var = tk.BooleanVar(value=False)
-        self._ayar_check(ic, "Sürekli tekrar (sonsuz, durana dek)", self.sonsuz_var)
-
-        self.sadece_reklam = tk.BooleanVar(value=False)
-        self._ayar_check(ic, "Sadece reklam (Ad) linkleri", self.sadece_reklam)
+        # Sürekli tekrar (sonsuz) + Sadece reklam (Ad) DAİMA açık — kullanıcı seçmez.
         self.headless = tk.BooleanVar(value=False)
         self._ayar_check(ic, "Görünmez mod (headless)", self.headless)
         self.mobil = tk.BooleanVar(value=False)
@@ -405,13 +465,14 @@ class Panel:
         for idx, x in enumerate(liste):
             tag = "cift" if idx % 2 else "tek"
             self.tablo.insert("", "end", tags=(tag,),
-                              values=(x["arama"], x["site"], x["tiklama"]))
+                              values=(x["arama"], x["tiklama"]))
 
     def _veriyi_al(self):
         veri = []
         for iid in self.tablo.get_children():
-            a, s, t = self.tablo.item(iid, "values")
-            veri.append({"arama": a, "site": s, "tiklama": int(t)})
+            a, t = self.tablo.item(iid, "values")
+            # site artık DB'den geliyor -> boş (JSON uyumu için alan korunur)
+            veri.append({"arama": a, "site": "", "tiklama": int(t)})
         return veri
 
     def _renkleri_tazele(self):
@@ -421,39 +482,122 @@ class Panel:
     def _kaydet(self):
         kaydet(self._veriyi_al())
 
-    # ---- site listesi ----
-    def _site_ekle(self):
-        s = self.f_site_giris.get().strip()
-        if s and s not in self.site_liste.get(0, "end"):
-            self.site_liste.insert("end", s)
-        self.f_site_giris.delete(0, "end")
+    # ---- hedef siteler (DB) ----
+    def _db_yenile(self):
+        """DB'deki bulunan reklam sitelerini tabloya doldur."""
+        try:
+            satirlar = google_bot.reklam_domainleri_listele()
+        except Exception:
+            satirlar = []
+        sec = self.db_tablo.selection()
+        secili = self.db_tablo.item(sec[0], "values")[0] if sec else None
+        for i in self.db_tablo.get_children():
+            self.db_tablo.delete(i)
+        for idx, r in enumerate(satirlar):
+            domain, sayi, ilk, son, arama = r
+            tag = "cift" if idx % 2 else "tek"
+            iid = self.db_tablo.insert("", "end", tags=(tag,),
+                                       values=(domain, sayi, arama or "", son or ""))
+            if domain == secili:
+                self.db_tablo.selection_set(iid)
+        self.db_lbl.config(text=f"{len(satirlar)} site")
 
-    def _site_sil(self):
-        for i in reversed(self.site_liste.curselection()):
-            self.site_liste.delete(i)
+    def _db_ekle(self):
+        """Elle domain ekle -> DB'ye yaz (hedeflerle senkron)."""
+        d = self.f_db_giris.get().strip()
+        if not d:
+            return
+        try:
+            yeni = google_bot.reklam_domain_kaydet([d], "manuel", self.yaz)
+        except Exception as ex:
+            self.yaz(f"DB ekleme hatası: {ex}", "hata")
+            yeni = []
+        self.f_db_giris.delete(0, "end")
+        if not yeni:
+            messagebox.showinfo(
+                "Bilgi", f"'{d}' eklenmedi.\nGeçersiz domain, kara listede "
+                         f"ya da zaten kayıtlı olabilir.")
+        self._db_yenile()
 
-    def _siteleri_al(self):
-        return ", ".join(self.site_liste.get(0, "end"))
+    def _db_sil(self):
+        sec = self.db_tablo.selection()
+        if not sec:
+            return
+        domain = self.db_tablo.item(sec[0], "values")[0]
+        if not messagebox.askyesno("Sil", f"'{domain}' DB'den silinsin mi?"):
+            return
+        try:
+            google_bot.reklam_domain_sil(domain)
+        except Exception as ex:
+            self.yaz(f"DB sil hatası: {ex}", "hata")
+        self._db_yenile()
 
-    def _siteleri_yukle(self, metin):
-        self.site_liste.delete(0, "end")
-        for s in [x.strip() for x in metin.split(",") if x.strip()]:
-            self.site_liste.insert("end", s)
+    # ---- kara liste (DB'ye kaydedilmeyenler) ----
+    def _kara_yenile(self):
+        """Kara liste tablosunu DB'den doldur."""
+        try:
+            satirlar = google_bot.engelli_listele()
+        except Exception:
+            satirlar = []
+        for i in self.kara_tablo.get_children():
+            self.kara_tablo.delete(i)
+        for idx, (domain, eklenme) in enumerate(satirlar):
+            tag = "cift" if idx % 2 else "tek"
+            self.kara_tablo.insert("", "end", tags=(tag,),
+                                   values=(domain, eklenme or ""))
+        self.kara_lbl.config(text=f"{len(satirlar)} domain")
+
+    def _kara_ekle(self):
+        d = self.f_kara_giris.get().strip()
+        if not d:
+            return
+        try:
+            eklendi = google_bot.engelli_ekle(d)
+        except Exception as ex:
+            self.yaz(f"Kara liste ekleme hatası: {ex}", "hata")
+            eklendi = False
+        if eklendi:
+            self.f_kara_giris.delete(0, "end")
+            self.yaz(f"Kara listeye eklendi: {d}", "ok")
+        else:
+            messagebox.showinfo(
+                "Bilgi", f"'{d}' eklenmedi.\nGeçersiz domain ya da zaten "
+                         f"kara listede olabilir.")
+        self._kara_yenile()
+        self._db_yenile()   # eşleşen hedef kayıtlar silinmiş olabilir
+
+    def _kara_sil(self):
+        sec = self.kara_tablo.selection()
+        if not sec:
+            return
+        domain = self.kara_tablo.item(sec[0], "values")[0]
+        if not messagebox.askyesno(
+                "Sil", f"'{domain}' kara listeden çıkarılsın mı?\n"
+                       f"Bundan sonra aramalarda görülürse DB'ye kaydedilir."):
+            return
+        try:
+            google_bot.engelli_sil(domain)
+        except Exception as ex:
+            self.yaz(f"Kara liste silme hatası: {ex}", "hata")
+        self._kara_yenile()
+
+    def _db_oto_yenile(self):
+        """Çalışırken bulunan yeni siteler canlı görünsün (periyodik tazele)."""
+        if self.calisiyor:
+            self._db_yenile()
+        self.kok.after(4000, self._db_oto_yenile)
 
     def _secimi_forma(self, e=None):
         sec = self.tablo.selection()
         if not sec:
             return
-        a, s, t = self.tablo.item(sec[0], "values")
+        a, t = self.tablo.item(sec[0], "values")
         self._formu_temizle()
         self.f_arama.insert(0, a)
-        self._siteleri_yukle(s)
         self.f_tik.set(int(t))
 
     def _formu_temizle(self):
         self.f_arama.delete(0, "end")
-        self.f_site_giris.delete(0, "end")
-        self.site_liste.delete(0, "end")
         self.f_tik.set(3)
 
     # ---------- buton işlemleri ----------
@@ -464,7 +608,7 @@ class Panel:
             return
         idx = len(self.tablo.get_children())
         self.tablo.insert("", "end", tags=("cift" if idx % 2 else "tek",),
-                          values=(a, self._siteleri_al(), self.f_tik.get()))
+                          values=(a, self.f_tik.get()))
         self._kaydet()
         self._formu_temizle()
 
@@ -476,8 +620,7 @@ class Panel:
         a = self.f_arama.get().strip()
         if not a:
             return
-        self.tablo.item(sec[0], values=(a, self._siteleri_al(),
-                                        self.f_tik.get()))
+        self.tablo.item(sec[0], values=(a, self.f_tik.get()))
         self._kaydet()
 
     def sil(self):
@@ -549,30 +692,29 @@ class Panel:
         threading.Thread(target=self._calistir, args=(veri,), daemon=True).start()
 
     def _calistir(self, veri):
-        tekrar = self.tekrar.get()
-        sonsuz = self.sonsuz_var.get()
+        sonsuz = True          # daima sürekli tekrar (durana dek)
+        reklam = True          # daima sadece reklam (Ad) linkleri
         detach = self.detach.get()
         headless = self.headless.get()
-        reklam = self.sadece_reklam.get()
         mobil = self.mobil.get()
         gercek_telefon = self.gercek_telefon.get()
         cihaz_seri = self._secili_seri()
         tur = 0
+        arama_sayaci = 0
+        # kaç aramada bir uzun 'oturum molası' verilecek (bot-önleme)
+        sonraki_mola = random.randint(5, 8)
         try:
             while not self.dur_bayrak:
                 tur += 1
-                if sonsuz:
-                    self.yaz(f"═══ Tur {tur} (sürekli) ═══")
-                elif tekrar > 1:
-                    self.yaz(f"═══ Tur {tur}/{tekrar} ═══")
+                self.yaz(f"═══ Tur {tur} (sürekli) ═══")
 
-                for x in veri:
+                for i, x in enumerate(veri):
                     if self.dur_bayrak:
                         break
                     try:
                         google_bot.run_bot(
                             x["arama"],
-                            hedef_site=x["site"],
+                            hedef_site="",   # hedefler DB'den gelir (senkron)
                             tiklama=x["tiklama"],
                             detach=detach,
                             gorunmez=headless,
@@ -586,16 +728,42 @@ class Panel:
                     except Exception as ex:
                         self.yaz(f"HATA ({x['arama']}): {ex}", "hata")
 
+                    arama_sayaci += 1
+                    if self.dur_bayrak:
+                        break
+
+                    son_arama = (i == len(veri) - 1)
+                    if arama_sayaci >= sonraki_mola:
+                        # --- oturum sınırı: uzun soğuma + IP yenile ---
+                        arama_sayaci = 0
+                        sonraki_mola = random.randint(5, 8)
+                        mola = random.uniform(180, 360)   # 3-6 dk
+                        self.yaz(f"⏸ Oturum molası: {int(mola)} sn "
+                                 f"(bot-önleme, IP yenileniyor)...")
+                        self._ucak_uygula()               # IP değiştir
+                        self._bekle_kesintili(mola)
+                    elif not son_arama:
+                        # --- aramalar arası DEĞİŞKEN kısa aralık ---
+                        ara = random.uniform(20, 75)
+                        if random.random() < 0.15:
+                            ara += random.uniform(60, 150)   # ara sıra uzun duraklama
+                        self.yaz(f"⏱ Sonraki aramaya {int(ara)} sn...")
+                        self._bekle_kesintili(ara)
+
                 if self.dur_bayrak:
                     break
                 # her turun sonunda uçak modu kapat-aç (IP yenile)
                 self._ucak_uygula()
-
-                if not sonsuz and tur >= tekrar:
-                    break
         finally:
             self.yaz("✓ Durduruldu." if self.dur_bayrak else "✓ Tamamlandı.", "ok")
             self.kok.after(0, self._bitti)
+
+    def _bekle_kesintili(self, saniye):
+        """saniye kadar bekle ama 'Durdur'a basılınca (dur_bayrak) hemen çık."""
+        gecen = 0.0
+        while gecen < saniye and not self.dur_bayrak:
+            time.sleep(0.5)
+            gecen += 0.5
 
     def cihaz_yenile(self):
         """ADB cihazlarını tara, combobox'ı doldur."""
