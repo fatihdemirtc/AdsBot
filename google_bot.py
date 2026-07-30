@@ -7,6 +7,7 @@ GUI:   run_bot(...) fonksiyonunu panel.py kullanır.
 """
 
 import os
+import re
 import sys
 import time
 import random
@@ -1044,13 +1045,87 @@ def _reklam_mi(href):
     return any(iz in h for iz in REKLAM_HREF_IZ)
 
 
-def _reklam_linkleri(driver):
-    """Sayfadaki TÜM reklam linklerini döndür (görünür, tekrarsız).
+# Reklam ağı ara host'ları: gerçek hedef DEĞİL, sadece yönlendirici.
+AG_HOSTLARI = ("googleadservices.com", "googlesyndication.com",
+               "doubleclick.net", "googleusercontent.com", "gstatic.com",
+               "googletagmanager.com")
+
+
+def _ag_hosti(host):
+    """Host bir Google/reklam ağı host'u mu (yani hedef site değil)?"""
+    h = _temiz_domain(host or "")
+    if not h:
+        return True
+    if h == "google.com" or h.startswith("google.") or ".google." in h:
+        return True
+    return any(h == a or h.endswith("." + a) for a in AG_HOSTLARI)
+
+
+def _gomulu_hostlar(metin):
+    """Metindeki (href/attribute) gömülü http(s) adreslerin host'ları, sırayla.
+
+    aclk href'inde hedef URL yüzde-kodlu gömülü olabilir (adurl=, &url=, ai=...).
+    Tekrar tekrar unquote edip TÜM http(s) adreslerini çıkarır.
+    """
+    import urllib.parse as up
+    s = metin or ""
+    for _ in range(3):
+        yeni = up.unquote(s)
+        if yeni == s:
+            break
+        s = yeni
+    return [_temiz_domain(m) for m in
+            re.findall(r'https?://([^/\s"\'\\,\]\)}<>]+)', s)]
+
+
+def _yazidan_host(metin):
+    """Reklamın görünen adresinden host çıkar ('https://www.site.com › yol')."""
+    ilk = ((metin or "").strip().splitlines() or [""])[0]
+    t = _temiz_domain(ilk)
+    t = re.split(r"[\s›|/?#,]", t)[0].strip(".")
+    return t if ("." in t and " " not in t) else ""
+
+
+def _domain_es(a, b):
+    """İki domain eşleşiyor mu (alt alan adı iki yönlü)."""
+    a, b = _temiz_domain(a or ""), _temiz_domain(b or "")
+    if not a or not b:
+        return False
+    return a == b or a.endswith("." + b) or b.endswith("." + a)
+
+
+def _reklam_hedef_domain(bilgi):
+    """Reklam linkinin GERÇEK hedef domaini.
+
+    Sıra: href içindeki ilk ağ-dışı host -> data-pcu/data-rw -> görünen adres
+    (cite / data-dtld). Google 'aclk' bağlantısında hedef bazen href'te HİÇ
+    geçmez (sunucu tarafı yönlendirme) -> o zaman cite/pcu kurtarır.
+    Eskiden bu durumda domain 'google.com' çıkıyor ve site listede olsa bile
+    'reklamda yok, atlandı' deniyordu.
+    """
+    for alan in ("href", "pcu"):
+        for h in _gomulu_hostlar(bilgi.get(alan) or ""):
+            if not _ag_hosti(h):
+                return h
+    for alan in ("dtld", "cite"):
+        h = _yazidan_host(bilgi.get(alan) or "")
+        if h and not _ag_hosti(h):
+            return h
+    return ""
+
+
+def _reklam_bilgileri(driver):
+    """Sayfadaki TÜM reklam linkleri + hedef ipuçları.
+
+    Döner: [{"el":WebElement, "href":str, "pcu":str, "cite":str, "dtld":str,
+             "domain":str}]  (domain = çözülmüş gerçek hedef, boş olabilir)
 
     Tespit JS ile yapılır -> Google'ın sık değişen reklam DOM'una dayanıklı:
       - reklam konteyneri içinde mi (#tads/#tadsb/#bottomads/#taw, data-text-ad/pcu/rw, aria-label)
       - 'Sponsorlu/Sponsored/Reklam' etiketi yakınında mı
       - href reklam izi taşıyor mu (aclk/adservices/pagead/adurl)
+    Ayrıca her link için hedef ipuçları toplanır (data-pcu/data-rw/data-dtld/cite)
+    çünkü aclk href'i hedefi taşımayabilir.
     """
     js = r"""
     const out = [], seen = new Set();
@@ -1075,6 +1150,22 @@ def _reklam_linkleri(driver):
       return false;
     };
     const hrefAd = (h) => /\/aclk|googleadservices|googlesyndication|\/pagead\/|adurl=/.test((h||'').toLowerCase());
+    // hedef ipuçları: aclk href'i hedefi taşımayabilir
+    const ipucu = (a) => {
+      let pcu = '', cite = '', dtld = '';
+      let p = a;
+      for (let i = 0; i < 8 && p; i++, p = p.parentElement) {
+        if (!p.getAttribute) continue;
+        if (!pcu)  pcu  = p.getAttribute('data-pcu') || p.getAttribute('data-rw') || '';
+        if (!dtld) dtld = p.getAttribute('data-dtld') || p.getAttribute('data-hveid-url') || '';
+        if (!cite && p.querySelector) {
+          const c = p.querySelector('cite, [role="text"] cite, span[class*="cite"]');
+          if (c) cite = (c.innerText || '').trim();
+        }
+        if (pcu && cite) break;
+      }
+      return {pcu: pcu, cite: cite, dtld: dtld};
+    };
     document.querySelectorAll('a[href]').forEach(a => {
       const href = a.href || '';
       if (!href || seen.has(href)) return;
@@ -1082,16 +1173,31 @@ def _reklam_linkleri(driver):
         const r = a.getBoundingClientRect();
         if (a.offsetParent !== null || r.width > 0 || r.height > 0) {
           seen.add(href);
-          out.push(a);
+          const ip = ipucu(a);
+          out.push({el: a, href: href, pcu: ip.pcu, cite: ip.cite, dtld: ip.dtld});
         }
       }
     });
     return out;
     """
     try:
-        return driver.execute_script(js) or []
+        ham = driver.execute_script(js) or []
     except Exception:
         return []
+    bilgiler = []
+    for b in ham:
+        try:
+            b = dict(b)
+            b["domain"] = _reklam_hedef_domain(b)
+            bilgiler.append(b)
+        except Exception:
+            continue
+    return bilgiler
+
+
+def _reklam_linkleri(driver):
+    """Sayfadaki TÜM reklam link ÖĞELERİ (görünür, tekrarsız)."""
+    return [b["el"] for b in _reklam_bilgileri(driver) if b.get("el") is not None]
 
 
 def _icinde_reklam_konteyner(a):
@@ -1108,14 +1214,20 @@ def _icinde_reklam_konteyner(a):
 
 
 def _reklam_link_bul(driver, domain):
-    """Reklamlar arasında HOST'u domain ile eşleşen ilk görünür linki döndür (tam URL değil)."""
+    """Reklamlar arasında hedefi domain ile eşleşen ilk görünür linki döndür.
+
+    Eşleşme çözülmüş hedef domain üzerinden (href + data-pcu + görünen adres),
+    sadece href host'u değil -> aclk href'i hedefi taşımasa da bulunur.
+    """
     domain = _temiz_domain(domain)
     if not domain:
         return None
-    for a in _reklam_linkleri(driver):
+    for b in _reklam_bilgileri(driver):
         try:
-            if _host_es(a.get_attribute("href") or "", domain):
-                return a
+            if _domain_es(b.get("domain") or "", domain):
+                return b.get("el")
+            if _host_es(b.get("href") or "", domain):
+                return b.get("el")
         except Exception:
             continue
     return None
@@ -1224,6 +1336,86 @@ def _siteyi_gez(driver, hedef, log_cb, etiket, serp_url=None, gez_dongu=5):
     insanca_bekle()
 
 
+def _yeni_sekmede_ac(driver, el, log_cb, etiket, serp_url=None, gez_dongu=5):
+    """Reklama CTRL+tık -> GERÇEK tıklama jesti ama YENİ SEKMEDE açılır.
+
+    Böylece SERP sekmesi olduğu gibi kalır: arama sayfası tekrar tekrar
+    yüklenmez, reklam listesi/DOM bozulmaz, sıradaki reklama direkt geçilir.
+    gclid + referer korunur (driver.get(aclk) değil, gerçek tık).
+
+    Döner: True  = girildi (yeni sekme ya da aynı sekmede gidip SERP'e dönüldü)
+           False = tık işlemedi -> çağıran eski yola düşsün.
+    Gerçek telefonda (dokunma) ctrl yok -> hiç denenmez, False döner.
+    """
+    if _dokunma_var(driver):
+        return False
+    ana = driver.current_window_handle
+    onceki = set(driver.window_handles)
+    onceki_url = driver.current_url
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+        insanca_bekle(0.4, 1.0, maks=1.6)
+        (ActionChains(driver)
+         .move_to_element(el)
+         .key_down(Keys.CONTROL)
+         .click(el)
+         .key_up(Keys.CONTROL)
+         .perform())
+    except Exception:
+        try:
+            ActionChains(driver).key_up(Keys.CONTROL).perform()
+        except Exception:
+            pass
+        return False
+
+    yeni = set()
+    for _ in range(20):                      # yeni sekme ~5 sn içinde açılır
+        try:
+            yeni = set(driver.window_handles) - onceki
+        except Exception:
+            yeni = set()
+        if yeni:
+            break
+        time.sleep(0.25)
+
+    if not yeni:
+        # ctrl işlemedi ve sayfa aynı sekmede gittiyse: gez, SERP'e dön
+        try:
+            gitti = driver.current_url != onceki_url
+        except Exception:
+            gitti = False
+        if not gitti:
+            return False
+        _log(log_cb, f"  -> (aynı sekmede) {etiket}")
+        mouse_gezin(driver, dongu=gez_dongu)
+        try:
+            driver.get(serp_url) if serp_url else driver.back()
+            sonuc_bekle(driver, 20)
+        except Exception:
+            pass
+        return True
+
+    _log(log_cb, f"  -> yeni sekmede: {etiket}")
+    try:
+        driver.switch_to.window(yeni.pop())
+        insanca_bekle(1.5, 3.0, maks=4.5)
+        mouse_gezin(driver, dongu=gez_dongu)   # sitede gez
+    except Exception as ex:
+        _log(log_cb, f"  ! '{etiket}' ziyaret hatası: {str(ex)[:70]}")
+    finally:
+        try:
+            if driver.current_window_handle != ana:
+                driver.close()
+        except Exception:
+            pass
+        try:
+            driver.switch_to.window(ana)
+        except Exception:
+            if driver.window_handles:
+                driver.switch_to.window(driver.window_handles[0])
+    return True
+
+
 def _yanlis_tikla_don(driver, serp_url, log_cb, kacin=None):
     """İnsan gibi: ilgisiz bir organik sonuca 'yanlışlıkla' tıkla, kısa gez, SERP'e dön.
 
@@ -1259,11 +1451,8 @@ def _reklam_domainleri_topla(driver, log_cb, arama=""):
     """SERP'teki TÜM reklam domainlerini çıkar, LOGLA ve DB'ye KAYDET."""
     bulunan = []
     try:
-        for a in _reklam_linkleri(driver):
-            try:
-                rd = _temiz_domain(_reklam_domain(a.get_attribute("href") or ""))
-            except Exception:
-                rd = ""
+        for b in _reklam_bilgileri(driver):
+            rd = b.get("domain") or ""
             if rd and rd not in bulunan:
                 bulunan.append(rd)
     except Exception:
@@ -1324,30 +1513,39 @@ def _reklam_haritasi(driver, log_cb=None, arama="", etiket="Tarama"):
     _tum_sayfayi_kaydir(driver)
     reklamlar = []
     gorulen = set()
-    for a in _reklam_linkleri(driver):
-        try:
-            href = a.get_attribute("href") or ""
-            dom = _temiz_domain(_href_host(href))
-        except Exception:
+    cozulemeyen = 0
+    ornek = ""
+    for b in _reklam_bilgileri(driver):
+        href = b.get("href") or ""
+        dom = b.get("domain") or ""
+        if not dom:
+            cozulemeyen += 1
+            ornek = ornek or href[:90]
             continue
-        if dom and href and dom not in gorulen:
+        if href and dom not in gorulen:
             gorulen.add(dom)
             reklamlar.append((dom, href))
     reklam_domain_kaydet([d for d, _ in reklamlar], arama, log_cb)
     _log(log_cb, f"  {etiket}: {len(reklamlar)} reklam bulundu "
                  f"({', '.join(d for d, _ in reklamlar) or '-'}).")
+    if cozulemeyen:
+        _log(log_cb, f"  ! {cozulemeyen} reklam linkinin hedefi çözülemedi "
+                     f"(örn: {ornek})")
     return reklamlar
 
 
 def _reklamlari_sirayla_isle(driver, domainler, log_cb, serp_url, iptal_mi,
                              gez_dongu=5, arama=""):
-    """Sayfayı süz, tüm reklamları (domain+href) yakala, listeyle kıyasla,
-    eşleşenlere TEK TEK gir.
+    """SADECE ilk sonuç sayfası: BİR KEZ tara, listeyle eşleşen reklamlara
+    sayfadaki sırayla TEK TEK gir.
 
-    ÖNEMLİ: her reklam ziyaretinden sonra SERP yeniden yükleniyor ve Google
-    reklam açık artırmasını TEKRAR çalıştırıyor -> reklam seti değişiyor.
-    Bu yüzden ilk taramaya güvenilmez; her dönüşte sayfa YENİDEN taranır.
-    Aksi halde ilk taramada olmayan (ama sonra çıkan) reklamlar es geçiliyordu.
+    Reklamlar CTRL+tık ile YENİ SEKMEDE açılır -> arama sayfası hiç yeniden
+    yüklenmez (eskiden her reklamdan sonra SERP tekrar açılıyor + tekrar
+    taranıyordu; ekranda arka arkaya bir sürü arama sayfası geziyordu).
+    Tıklama yine GERÇEK tık jesti: gclid + referer korunur.
+
+    Sadece aynı sekmede açılmak zorunda kalınırsa (gerçek telefon / ctrl
+    işlemezse) SERP bir kez geri yüklenir; sıradaki reklam taze DOM'da aranır.
     """
     # liste sırasını koru, tekrarsız
     liste = []
@@ -1356,46 +1554,45 @@ def _reklamlari_sirayla_isle(driver, domainler, log_cb, serp_url, iptal_mi,
         if td and td not in liste:
             liste.append(td)
 
-    reklamlar = _reklam_haritasi(driver, log_cb, arama, "İlk tarama")
+    # --- TEK tarama: ilk sayfadaki tüm reklamlar (DOM sırasıyla) ---
+    reklamlar = _reklam_haritasi(driver, log_cb, arama, "Sayfa taraması")
 
-    def _href_bul(domain):
-        for d, h in reklamlar:
-            if d == domain or d.endswith("." + domain) or domain.endswith("." + d):
-                return h
-        return None
+    # sayfadaki sırayla, listede olan reklamlar
+    sirali = []
+    for dom, href in reklamlar:
+        hedef_dom = next((t for t in liste if _domain_es(dom, t)), None)
+        if hedef_dom and not any(d == hedef_dom for d, _ in sirali):
+            sirali.append((hedef_dom, href))
 
-    # === Listeyle kıyasla, eşleşenlere tek tek gir ===
-    # ÖNEMLI: reklama GERÇEK tıklama ile girilir (reklam <a> öğesine click).
-    # Eski yol driver.get(aclk_url) idi -> Google referer'ı + gclid taşınmıyordu,
-    # tıklama jesti yoktu = 'geçersiz tıklama' sinyali. Artık öğeyi tıklıyoruz;
-    # gclid + referer korunur, sonra SERP'e (serp_url) kesin dönülür.
+    yok = len(liste) - len(sirali)
+    _log(log_cb, f"  Listeyle eşleşen reklam: {len(sirali)} "
+                 f"({', '.join(d for d, _ in sirali) or '-'})"
+                 + (f"; {yok} site bu sayfada reklamda yok." if yok > 0 else ""))
+
     girilen = 0
-    for sira, domain in enumerate(liste):
+    for domain, href in sirali:
         if iptal_mi():
             _log(log_cb, "İptal edildi.")
             break
-        # İlk domain hariç: SERP yeniden yüklendi -> reklamlar değişmiş olabilir
-        if sira > 0 and girilen > 0:
-            reklamlar = _reklam_haritasi(driver, log_cb, arama, "Yeniden tarama")
-        href = _href_bul(domain)
-        if not href:
-            _log(log_cb, f"  – '{domain}' bu sayfada reklamda yok, atlandı.")
-            continue
-        # reklam öğesini TAZE bul (SERP dönüşlerinde DOM yenilenir)
+        # öğeyi taze bul (aynı sekmede gidilip dönüldüyse DOM yenilenmiş olur)
         hedef = _reklam_link_bul(driver, domain)
         if not hedef:
             _tum_sayfayi_kaydir(driver)             # alt reklamlar DOM'a gelsin
             hedef = _reklam_link_bul(driver, domain)
-        if hedef:
-            _log(log_cb, f"  ✓ '{domain}' reklamda VAR -> tıklanıyor (gerçek tık)")
-            _siteyi_gez(driver, hedef, log_cb, f"[Ad] {domain}", serp_url, gez_dongu)
+        if hedef is not None:
+            _log(log_cb, f"  ✓ '{domain}' -> tıklanıyor (gerçek tık)")
+            if not _yeni_sekmede_ac(driver, hedef, log_cb, f"[Ad] {domain}",
+                                    serp_url, gez_dongu):
+                # ctrl+tık işlemedi -> aynı sekme yolu (dönüşte SERP yenilenir)
+                _siteyi_gez(driver, hedef, log_cb, f"[Ad] {domain}",
+                            serp_url, gez_dongu)
         else:
-            # öğe bulunamadı (nad.) -> son çare doğrudan aç
+            # öğe kayboldu (SERP yenilendi vb.) -> son çare href'i aç
             _log(log_cb, f"  ✓ '{domain}' -> giriliyor (öğe yok, doğrudan)")
             _ziyaret_href(driver, href, f"[Ad] {domain}", log_cb, gez_dongu)
         girilen += 1
 
-    _log(log_cb, f"  Liste tarama bitti: {girilen}/{len(liste)} siteye girildi.")
+    _log(log_cb, f"  Sayfa bitti: {girilen}/{len(sirali)} reklama girildi.")
     return girilen
 
 
