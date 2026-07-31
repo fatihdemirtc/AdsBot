@@ -11,6 +11,7 @@ import re
 import sys
 import time
 import random
+import datetime
 import shutil
 import sqlite3
 import tempfile
@@ -244,6 +245,18 @@ def _db_baglan():
         con.commit()
     except Exception:
         pass
+    # tıklama günlüğü: her başarılı giriş bir satır (istatistik sayfası okur)
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS tiklamalar("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " zaman TEXT,"                  # 'YYYY-MM-DD HH:MM:SS' yerel saat
+        " tarih TEXT,"                  # 'YYYY-MM-DD' (gün/hafta/ay gruplaması)
+        " domain TEXT,"
+        " arama TEXT,"
+        " tur TEXT)")                   # 'reklam' | 'organik'
+    con.execute("CREATE INDEX IF NOT EXISTS ix_tiklama_tarih"
+                " ON tiklamalar(tarih)")
+    con.commit()
     return con
 
 
@@ -353,6 +366,125 @@ def reklam_domain_sil(domain):
         return True
     except Exception:
         return False
+
+
+# ---------------- Tıklama günlüğü / istatistik ----------------
+
+AY_KISA = ["Oca", "Şub", "Mar", "Nis", "May", "Haz",
+           "Tem", "Ağu", "Eyl", "Eki", "Kas", "Ara"]
+
+# periyot -> (SQLite strftime kalıbı, kaç kova gösterilir)
+PERIYOTLAR = {"gun": ("%Y-%m-%d", 30), "hafta": ("%Y-%W", 12), "ay": ("%Y-%m", 12)}
+
+
+def tiklama_kaydet(domain, arama="", tur="reklam", log_cb=None):
+    """Başarılı bir tıklamayı (siteye giriş) günlüğe yaz. Başarılıysa True."""
+    d = _temiz_domain(domain or "")
+    if not d:
+        return False
+    su_an = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        con = _db_baglan()
+        with con:
+            con.execute(
+                "INSERT INTO tiklamalar(zaman, tarih, domain, arama, tur)"
+                " VALUES(?,?,?,?,?)",
+                (su_an, su_an[:10], d, arama or "", tur))
+        con.close()
+        return True
+    except Exception as ex:
+        _log(log_cb, f"  Tıklama kaydı hatası: {str(ex)[:70]}")
+        return False
+
+
+def _tur_filtre(tur):
+    """(sql parçası, parametreler) — tur None ise filtre yok."""
+    if tur in ("reklam", "organik"):
+        return " AND tur=?", [tur]
+    return "", []
+
+
+def tiklama_toplam(gun=1, tur=None):
+    """Son `gun` gündeki (bugün dahil) toplam tıklama sayısı."""
+    basla = (datetime.date.today() - datetime.timedelta(days=max(1, gun) - 1)
+             ).strftime("%Y-%m-%d")
+    ek, par = _tur_filtre(tur)
+    try:
+        con = _db_baglan()
+        n = con.execute(
+            "SELECT COUNT(*) FROM tiklamalar WHERE tarih>=?" + ek,
+            [basla] + par).fetchone()[0]
+        con.close()
+        return int(n or 0)
+    except Exception:
+        return 0
+
+
+def _kova_listesi(periyot, adet):
+    """Son `adet` kovanın (anahtar, etiket, başlangıç tarihi) listesi — eskiden yeniye."""
+    bugun = datetime.date.today()
+    out = []
+    if periyot == "ay":
+        y, a = bugun.year, bugun.month
+        for _ in range(adet):
+            out.append((f"{y:04d}-{a:02d}", f"{AY_KISA[a - 1]} {y}",
+                        datetime.date(y, a, 1)))
+            a -= 1
+            if a == 0:
+                y, a = y - 1, 12
+    elif periyot == "hafta":
+        # haftanın pazartesisi (SQLite %W ile aynı: pazartesi başlangıçlı)
+        bas = bugun - datetime.timedelta(days=bugun.weekday())
+        for i in range(adet):
+            g = bas - datetime.timedelta(weeks=i)
+            out.append((g.strftime("%Y-%W"),
+                        f"{g.day} {AY_KISA[g.month - 1]}", g))
+    else:
+        for i in range(adet):
+            g = bugun - datetime.timedelta(days=i)
+            out.append((g.strftime("%Y-%m-%d"),
+                        f"{g.day} {AY_KISA[g.month - 1]}", g))
+    return list(reversed(out))
+
+
+def tiklama_seri(periyot="gun", tur=None):
+    """Grafik verisi: [(anahtar, etiket, adet), ...] eskiden yeniye, boş kovalar 0."""
+    kalip, adet = PERIYOTLAR.get(periyot, PERIYOTLAR["gun"])
+    kovalar = _kova_listesi(periyot, adet)
+    basla = kovalar[0][2].strftime("%Y-%m-%d")
+    ek, par = _tur_filtre(tur)
+    sayilar = {}
+    try:
+        con = _db_baglan()
+        for k, n in con.execute(
+                f"SELECT strftime('{kalip}', tarih) k, COUNT(*)"
+                f" FROM tiklamalar WHERE tarih>=?{ek} GROUP BY k",
+                [basla] + par):
+            sayilar[k] = n
+        con.close()
+    except Exception:
+        pass
+    return [(k, etiket, int(sayilar.get(k, 0))) for k, etiket, _ in kovalar]
+
+
+def tiklama_kirilim(periyot="gun", kova=None, tur=None):
+    """Bir kovadaki site kırılımı: [(domain, adet, reklam_adet, organik_adet), ...]."""
+    kalip, _ = PERIYOTLAR.get(periyot, PERIYOTLAR["gun"])
+    if not kova:
+        return []
+    ek, par = _tur_filtre(tur)
+    try:
+        con = _db_baglan()
+        satirlar = con.execute(
+            f"SELECT domain, COUNT(*) n,"
+            f" SUM(CASE WHEN tur='reklam' THEN 1 ELSE 0 END),"
+            f" SUM(CASE WHEN tur!='reklam' THEN 1 ELSE 0 END)"
+            f" FROM tiklamalar WHERE strftime('{kalip}', tarih)=?{ek}"
+            f" GROUP BY domain ORDER BY n DESC, domain", [kova] + par).fetchall()
+        con.close()
+        return [(d, int(n or 0), int(r or 0), int(o or 0)) for d, n, r, o in satirlar]
+    except Exception:
+        return []
 
 
 # Tarayıcı parmak izini insanlaştırır: webdriver/plugins/languages/chrome/WebGL/permissions.
@@ -1591,6 +1723,7 @@ def _reklamlari_sirayla_isle(driver, domainler, log_cb, serp_url, iptal_mi,
             _log(log_cb, f"  ✓ '{domain}' -> giriliyor (öğe yok, doğrudan)")
             _ziyaret_href(driver, href, f"[Ad] {domain}", log_cb, gez_dongu)
         girilen += 1
+        tiklama_kaydet(domain, arama, "reklam", log_cb)
 
     _log(log_cb, f"  Sayfa bitti: {girilen}/{len(sirali)} reklama girildi.")
     return girilen
@@ -1886,6 +2019,7 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
                         break
                     dom, href = yakalanan[i]
                     _ziyaret_href(driver, href, f"[Ad] {dom[:50]}", log_cb)
+                    tiklama_kaydet(dom, arama, "reklam", log_cb)
         elif domainler:
             # --- Hedef site(ler): SERP'teki gerçek sonuca TIKLA ---
             # Her domaini SERP'te taze bul, tıkla, gez, SERP'e dön, sıradakine geç.
@@ -1919,6 +2053,9 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
                 _log(log_cb, f"  '{domain}' bulundu ({etiket}), tıklanıyor.")
                 _siteyi_gez(driver, hedef, log_cb, etiket, serp_url)
                 tiklanan += 1
+                tiklama_kaydet(domain, arama,
+                               "reklam" if etiket.startswith("[Ad]") else "organik",
+                               log_cb)
                 # SERP'e dönünce DOM yenilendi -> alt reklam/sonuçlar tekrar yüklensin
                 if not iptal_mi():
                     _tum_sayfayi_kaydir(driver)
@@ -1933,7 +2070,14 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
                 sonuclar = [s for s in sonuclar if s.is_displayed()]
                 if i >= len(sonuclar):
                     break
+                # tıklamadan önce hedef host'u al (sonra öğe stale olur)
+                try:
+                    _a = sonuclar[i].find_element(By.XPATH, "./ancestor::a[1]")
+                    _dom = _href_host(_a.get_attribute("href") or "")
+                except Exception:
+                    _dom = ""
                 _siteyi_gez(driver, sonuclar[i], log_cb, sonuclar[i].text[:60], serp_url)
+                tiklama_kaydet(_dom, arama, "organik", log_cb)
 
         _log(log_cb, f"'{arama}' bitti.")
 

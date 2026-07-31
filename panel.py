@@ -15,6 +15,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, font as tkfont
 
 import google_bot
+import istatistik
 
 
 def _temel_klasor():
@@ -107,35 +108,20 @@ class Panel:
 
         self._stil()
 
-        # --- Kaydırılabilir kapsayıcı: içerik ekrandan büyükse dikey scroll çıkar ---
-        disk = tk.Frame(kok, bg=BG)
-        disk.pack(fill="both", expand=True)
-        self._canvas = tk.Canvas(disk, bg=BG, highlightthickness=0)
-        vsb = ttk.Scrollbar(disk, orient="vertical", command=self._canvas.yview)
-        self._canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        self._canvas.pack(side="left", fill="both", expand=True)
-
-        # Tüm panel içeriği bu iç çerçeveye girer
-        self.icerik = tk.Frame(self._canvas, bg=BG)
-        self._ic_win = self._canvas.create_window((0, 0), window=self.icerik, anchor="nw")
-        self.icerik.bind(
-            "<Configure>",
-            lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
-        self._canvas.bind(
-            "<Configure>",
-            lambda e: self._canvas.itemconfigure(self._ic_win, width=e.width))
-        # Fare tekeriyle kaydır (imleç panel üzerindeyken)
-        self._canvas.bind_all("<MouseWheel>", self._tekerle_kaydir)
+        # --- Ana sayfa: üstte başlık, sağda ayarlar, geri kalan her yer GÜNLÜK ---
+        self.icerik = tk.Frame(kok, bg=BG)
+        self.icerik.pack(fill="both", expand=True)
 
         self._header()
 
         govde = tk.Frame(self.icerik, bg=BG)
-        govde.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        govde.pack(fill="both", expand=True, padx=16, pady=(0, 14))
 
-        self._sol_tablo(govde)
-        self._sag_panel(govde)
-        self._konsol()
+        self._sag_panel(govde)     # sağ kolon: ayarlar + başlat/durdur
+        self._konsol(govde)        # kalan alan: geniş günlük
+
+        # Arama listesi / hedef siteler / kara liste ayrı pencerede (Tanımlamalar)
+        self._tanim_pencere()
 
         self._tabloyu_doldur(yukle())
         self._db_yenile()          # bulunan siteler (DB) tablosunu doldur
@@ -143,9 +129,61 @@ class Panel:
         self._db_oto_yenile()      # çalışırken canlı tazele
         kok.protocol("WM_DELETE_WINDOW", self.kapat)
 
-    def _tekerle_kaydir(self, e):
-        """Fare tekeri ile dikey kaydırma."""
+    # ---------- Tanımlamalar penceresi ----------
+    def _tanim_pencere(self):
+        """Arama listesi + hedef siteler + kara liste: ayrı (gizli açılan) pencere.
+
+        Pencere başta gizlidir ama İÇİNDEKİ tablolar hep var olur -> BAŞLAT,
+        kaydetme ve canlı tazeleme pencere kapalıyken de çalışır.
+        """
+        p = tk.Toplevel(self.kok)
+        p.title("Google Bot  •  Tanımlamalar")
+        p.configure(bg=BG)
+        sw, sh = p.winfo_screenwidth(), p.winfo_screenheight()
+        w, h = min(760, sw - 60), min(840, sh - 80)
+        p.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 4)}")
+        p.minsize(560, 480)
+
+        # içerik uzun -> dikey kaydırma
+        disk = tk.Frame(p, bg=BG)
+        disk.pack(fill="both", expand=True)
+        self._canvas = tk.Canvas(disk, bg=BG, highlightthickness=0)
+        vsb = ttk.Scrollbar(disk, orient="vertical", command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self._canvas.pack(side="left", fill="both", expand=True)
+        ic = tk.Frame(self._canvas, bg=BG)
+        self._ic_win = self._canvas.create_window((0, 0), window=ic, anchor="nw")
+        ic.bind("<Configure>",
+                lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
+        self._canvas.bind(
+            "<Configure>",
+            lambda e: self._canvas.itemconfigure(self._ic_win, width=e.width))
+        p.bind("<MouseWheel>", self._tekerle_kaydir)
+
+        self._sol_tablo(ic)
+
+        p.protocol("WM_DELETE_WINDOW", p.withdraw)
+        p.withdraw()
+        self.tanim_pen = p
+
+    def tanim_ac(self):
+        """Tanımlamalar penceresini göster (açıksa öne getir) + tazele."""
         try:
+            self.tanim_pen.deiconify()
+            self.tanim_pen.lift()
+            self.tanim_pen.focus_force()
+            self._db_yenile()
+            self._kara_yenile()
+        except Exception as ex:
+            messagebox.showerror("Tanımlamalar", f"Pencere açılamadı:\n{ex}")
+
+    def _tekerle_kaydir(self, e):
+        """Fare tekeri ile dikey kaydırma (tablo/metin üstündeyken karışmasın)."""
+        try:
+            alt = self.tanim_pen.winfo_containing(e.x_root, e.y_root)
+            if isinstance(alt, (ttk.Treeview, tk.Text, tk.Entry)):
+                return
             self._canvas.yview_scroll(int(-e.delta / 120), "units")
         except Exception:
             pass
@@ -197,9 +235,14 @@ class Panel:
         tk.Label(sol, text="Aramaları ve hedef siteleri yönet, otomatik gez",
                  bg=BG, fg=SOLUK, font=("Segoe UI", 9)).pack(anchor="w")
 
-        # sağ üst: durum + IP
+
+        # sağ üst: tanımlamalar + istatistik butonları, durum + IP
         sag = tk.Frame(h, bg=BG)
         sag.pack(side="right")
+        HoverButton(h, PANEL2, KENAR, text="📊  İstatistikler",
+                    command=self.istatistik_ac).pack(side="right", padx=(0, 14))
+        HoverButton(h, ACCENT, ACCENT_H, text="🗂  Tanımlamalar",
+                    command=self.tanim_ac).pack(side="right", padx=(0, 10))
         self.durum_lbl = tk.Label(sag, text="● Hazır", bg=BG, fg=SOLUK,
                                    font=("Segoe UI Semibold", 10))
         self.durum_lbl.pack(anchor="e")
@@ -212,10 +255,10 @@ class Panel:
                     command=self.ip_yenile).pack(side="left", padx=(6, 0))
         self.ip_yenile()
 
-    # ---------- sol: arama listesi + bulunan siteler (DB) ----------
+    # ---------- Tanımlamalar içeriği: arama listesi + hedef siteler + kara liste ----------
     def _sol_tablo(self, usta):
         sol = tk.Frame(usta, bg=BG)
-        sol.pack(side="left", fill="both", expand=True, padx=(0, 14))
+        sol.pack(fill="both", expand=True, padx=16, pady=(14, 16))
 
         # === Arama Listesi kartı (sadece arama kelimesi + tıklama) ===
         dis, ic = self._kart(sol, "Arama Listesi")
@@ -223,10 +266,10 @@ class Panel:
 
         tcer = tk.Frame(ic, bg=PANEL)
         tcer.pack(fill="x")
-        self.tablo = ttk.Treeview(tcer, style="Trv.Treeview", height=3,
+        self.tablo = ttk.Treeview(tcer, style="Trv.Treeview", height=7,
                                   columns=("arama", "tik"),
                                   show="headings", selectmode="browse")
-        self.tablo.heading("arama", text="ARAMA KELİMESİ")
+        self.tablo.heading("arama", text="ARAMA KELİMESİ", anchor="w")
         self.tablo.heading("tik", text="TIK")
         self.tablo.column("arama", width=320, anchor="w")
         self.tablo.column("tik", width=45, anchor="center")
@@ -272,13 +315,13 @@ class Panel:
 
         dtcer = tk.Frame(dic, bg=PANEL)
         dtcer.pack(fill="both", expand=True)
-        self.db_tablo = ttk.Treeview(dtcer, style="Trv.Treeview", height=5,
+        self.db_tablo = ttk.Treeview(dtcer, style="Trv.Treeview", height=9,
                                      columns=("domain", "gor", "arama", "son"),
                                      show="headings", selectmode="browse")
-        self.db_tablo.heading("domain", text="SİTE (DOMAIN)")
+        self.db_tablo.heading("domain", text="SİTE (DOMAIN)", anchor="w")
         self.db_tablo.heading("gor", text="GÖR")
-        self.db_tablo.heading("arama", text="ARAMA")
-        self.db_tablo.heading("son", text="SON GÖRÜLME")
+        self.db_tablo.heading("arama", text="ARAMA", anchor="w")
+        self.db_tablo.heading("son", text="SON GÖRÜLME", anchor="w")
         self.db_tablo.column("domain", width=205, anchor="w")
         self.db_tablo.column("gor", width=42, anchor="center")
         self.db_tablo.column("arama", width=140, anchor="w")
@@ -320,11 +363,11 @@ class Panel:
 
         ktcer = tk.Frame(kic, bg=PANEL)
         ktcer.pack(fill="x")
-        self.kara_tablo = ttk.Treeview(ktcer, style="Trv.Treeview", height=4,
+        self.kara_tablo = ttk.Treeview(ktcer, style="Trv.Treeview", height=6,
                                        columns=("domain", "eklenme"),
                                        show="headings", selectmode="browse")
-        self.kara_tablo.heading("domain", text="DOMAIN")
-        self.kara_tablo.heading("eklenme", text="EKLENME")
+        self.kara_tablo.heading("domain", text="DOMAIN", anchor="w")
+        self.kara_tablo.heading("eklenme", text="EKLENME", anchor="w")
         self.kara_tablo.column("domain", width=290, anchor="w")
         self.kara_tablo.column("eklenme", width=150, anchor="w")
         self.kara_tablo.tag_configure("tek", background=PANEL)
@@ -366,8 +409,8 @@ class Panel:
 
     # ---------- sağ: ayarlar + kontrol ----------
     def _sag_panel(self, usta):
-        sag = tk.Frame(usta, bg=BG, width=260)
-        sag.pack(side="left", fill="y")
+        sag = tk.Frame(usta, bg=BG, width=278)
+        sag.pack(side="right", fill="y", padx=(14, 0))
         sag.pack_propagate(False)
 
         dis, ic = self._kart(sag, "Ayarlar")
@@ -435,23 +478,52 @@ class Panel:
                            cursor="hand2")
         c.pack(fill="x", pady=2)
 
-    # ---------- konsol ----------
-    def _konsol(self):
-        dis = tk.Frame(self.icerik, bg="#0b1120", highlightbackground=KENAR,
+    # ---------- konsol (ana sayfanın büyük kısmı) ----------
+    def _konsol(self, usta):
+        dis = tk.Frame(usta, bg="#0b1120", highlightbackground=KENAR,
                        highlightthickness=1)
-        dis.pack(fill="both", expand=False, padx=16, pady=(0, 14))
+        dis.pack(side="left", fill="both", expand=True)
         ust = tk.Frame(dis, bg="#0b1120")
-        ust.pack(fill="x", padx=10, pady=(6, 0))
+        ust.pack(fill="x", padx=12, pady=(8, 0))
         tk.Label(ust, text="GÜNLÜK", bg="#0b1120", fg=SOLUK,
-                 font=("Segoe UI Semibold", 8)).pack(side="left")
+                 font=("Segoe UI Semibold", 9)).pack(side="left")
+        # tanımlı kayıt özeti (arama / hedef site / kara liste sayıları)
+        self.ozet_lbl = tk.Label(ust, text="", bg="#0b1120", fg=SOLUK,
+                                 font=("Segoe UI", 8))
+        self.ozet_lbl.pack(side="left", padx=(12, 0))
         HoverButton(ust, "#0b1120", PANEL2, text="temizle",
                     command=self._log_temizle).pack(side="right")
-        self.log = tk.Text(dis, height=8, bg="#0b1120", fg="#cbd5e1",
+        self.oto_kaydir = tk.BooleanVar(value=True)
+        tk.Checkbutton(ust, text="oto kaydır", variable=self.oto_kaydir,
+                       bg="#0b1120", fg=SOLUK, selectcolor=PANEL2,
+                       activebackground="#0b1120", activeforeground=METIN,
+                       font=("Segoe UI", 8), relief="flat", highlightthickness=0,
+                       cursor="hand2").pack(side="right", padx=(0, 10))
+
+        gov = tk.Frame(dis, bg="#0b1120")
+        gov.pack(fill="both", expand=True, padx=12, pady=(4, 10))
+        self.log = tk.Text(gov, height=24, bg="#0b1120", fg="#cbd5e1",
                            insertbackground=METIN, relief="flat", wrap="word",
-                           font=("Consolas", 9), state="disabled")
-        self.log.pack(fill="both", expand=True, padx=10, pady=(2, 8))
+                           font=("Consolas", 10), state="disabled")
+        lsb = ttk.Scrollbar(gov, orient="vertical", command=self.log.yview)
+        self.log.configure(yscrollcommand=lsb.set)
+        lsb.pack(side="right", fill="y")
+        self.log.pack(side="left", fill="both", expand=True)
         self.log.tag_configure("hata", foreground=KIRMIZI_H)
         self.log.tag_configure("ok", foreground=YESIL_H)
+
+    def _ozet_tazele(self):
+        """Günlük başlığındaki 'x arama • y hedef • z kara liste' özeti."""
+        if not hasattr(self, "ozet_lbl"):
+            return
+        try:
+            a = len(self.tablo.get_children())
+            d = len(self.db_tablo.get_children())
+            k = len(self.kara_tablo.get_children())
+        except Exception:
+            return
+        self.ozet_lbl.config(
+            text=f"•  {a} arama   {d} hedef site   {k} kara liste")
 
     def _log_temizle(self):
         self.log.config(state="normal")
@@ -466,6 +538,7 @@ class Panel:
             tag = "cift" if idx % 2 else "tek"
             self.tablo.insert("", "end", tags=(tag,),
                               values=(x["arama"], x["tiklama"]))
+        self._ozet_tazele()
 
     def _veriyi_al(self):
         veri = []
@@ -501,6 +574,7 @@ class Panel:
             if domain == secili:
                 self.db_tablo.selection_set(iid)
         self.db_lbl.config(text=f"{len(satirlar)} site")
+        self._ozet_tazele()
 
     def _db_ekle(self):
         """Elle domain ekle -> DB'ye yaz (hedeflerle senkron)."""
@@ -546,6 +620,7 @@ class Panel:
             self.kara_tablo.insert("", "end", tags=(tag,),
                                    values=(domain, eklenme or ""))
         self.kara_lbl.config(text=f"{len(satirlar)} domain")
+        self._ozet_tazele()
 
     def _kara_ekle(self):
         d = self.f_kara_giris.get().strip()
@@ -611,6 +686,7 @@ class Panel:
                           values=(a, self.f_tik.get()))
         self._kaydet()
         self._formu_temizle()
+        self._ozet_tazele()
 
     def guncelle(self):
         sec = self.tablo.selection()
@@ -631,18 +707,33 @@ class Panel:
         self._renkleri_tazele()
         self._kaydet()
         self._formu_temizle()
+        self._ozet_tazele()
 
     # ---------- log ----------
+    LOG_MAKS_SATIR = 5000     # sürekli çalışırken bellek şişmesin
+
     def yaz(self, mesaj, tag=None):
         def _ekle():
             self.log.config(state="normal")
-            self.log.insert("end", mesaj + "\n", tag or "")
-            self.log.see("end")
+            self.log.insert("end", time.strftime("%H:%M:%S  ") + mesaj + "\n",
+                            tag or "")
+            fazla = int(self.log.index("end-1c").split(".")[0]) - self.LOG_MAKS_SATIR
+            if fazla > 0:
+                self.log.delete("1.0", f"{fazla + 1}.0")
+            if self.oto_kaydir.get():
+                self.log.see("end")
             self.log.config(state="disabled")
         self.kok.after(0, _ekle)
 
     def _durum(self, metin, renk):
         self.kok.after(0, lambda: self.durum_lbl.config(text="● " + metin, fg=renk))
+
+    # ---------- istatistik penceresi ----------
+    def istatistik_ac(self):
+        try:
+            istatistik.pencere_ac(self.kok)
+        except Exception as ex:
+            messagebox.showerror("İstatistik", f"Pencere açılamadı:\n{ex}")
 
     # ---------- public IP ----------
     def ip_yenile(self):
