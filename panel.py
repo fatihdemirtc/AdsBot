@@ -27,6 +27,24 @@ def _temel_klasor():
 
 KLASOR = _temel_klasor()
 JSON_YOL = os.path.join(KLASOR, "aramalar.json")
+AYAR_YOL = os.path.join(KLASOR, "ayarlar.json")
+
+
+def ayar_yukle():
+    """Panel ayarlarını (ör. konum koordinatı) getir."""
+    try:
+        with open(AYAR_YOL, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def ayar_kaydet(ayar):
+    try:
+        with open(AYAR_YOL, "w", encoding="utf-8") as f:
+            json.dump(ayar, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 # ---- Renk paleti (koyu, modern) ----
 BG        = "#0f172a"   # ana arka plan (slate-900)
@@ -428,6 +446,20 @@ class Panel:
         self.sadece_secili = tk.BooleanVar(value=False)
         self._ayar_check(ic, "Sadece seçili satır", self.sadece_secili)
 
+        # Konum: reklamların çoğu SADECE kesin konumla geliyor.
+        # Gerçek telefonda cihazın GPS'i kullanılır; PC'de GPS yok ->
+        # buraya enlem,boylam yazılırsa tarayıcıya o konum verilir.
+        kf = tk.Frame(ic, bg=PANEL)
+        kf.pack(fill="x", pady=(8, 2))
+        tk.Label(kf, text="Konum (enlem,boylam) - PC modu:", bg=PANEL, fg=SOLUK,
+                 font=("Segoe UI", 9)).pack(anchor="w")
+        self.konum = tk.StringVar(value=ayar_yukle().get("konum", ""))
+        tk.Entry(kf, textvariable=self.konum, bg=PANEL2, fg=METIN,
+                 insertbackground=METIN, relief="flat",
+                 font=("Segoe UI", 10)).pack(fill="x", ipady=4, pady=(2, 0))
+        tk.Label(kf, text="boş = telefonun kendi GPS'i (ör: 41.0390,28.8570)",
+                 bg=PANEL, fg=SOLUK, font=("Segoe UI", 8)).pack(anchor="w")
+
         # ADB cihaz seçimi
         df = tk.Frame(ic, bg=PANEL)
         df.pack(fill="x", pady=(8, 2))
@@ -556,6 +588,10 @@ class Panel:
 
     def _kaydet(self):
         kaydet(self._veriyi_al())
+        try:
+            ayar_kaydet({"konum": (self.konum.get() or "").strip()})
+        except Exception:
+            pass
 
     # ---- hedef siteler (DB) ----
     def _db_yenile(self):
@@ -792,6 +828,7 @@ class Panel:
         mobil = self.mobil.get()
         gercek_telefon = self.gercek_telefon.get()
         cihaz_seri = self._secili_seri()
+        konum_kord = self._konum_kord()
         tur = 0
         arama_sayaci = 0
         # kaç aramada bir uzun 'oturum molası' verilecek (bot-önleme)
@@ -817,6 +854,7 @@ class Panel:
                             mobil=mobil,
                             gercek_telefon=gercek_telefon,
                             cihaz_seri=cihaz_seri,
+                            konum_kord=konum_kord,
                         )
                     except Exception as ex:
                         self.yaz(f"HATA ({x['arama']}): {ex}", "hata")
@@ -876,6 +914,19 @@ class Panel:
             self.cihaz.set("(otomatik)")
         if hasattr(self, "log"):
             self.yaz(f"ADB: {len(cihazlar)} cihaz bulundu.")
+
+    def _konum_kord(self):
+        """'enlem,boylam' -> (float, float); boş/bozuksa None."""
+        ham = (self.konum.get() or "").replace(" ", "")
+        if not ham:
+            return None
+        try:
+            a, b = ham.replace(";", ",").split(",")[:2]
+            return (float(a), float(b))
+        except Exception:
+            self.yaz("Konum formatı hatalı, yok sayıldı (ör: 41.0390,28.8570)",
+                     "hata")
+            return None
 
     def _secili_seri(self):
         secim = self.cihaz.get()

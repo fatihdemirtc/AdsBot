@@ -1037,6 +1037,77 @@ def konum_popup_kapat(driver):
     return False
 
 
+def _konum_kesin_mi(driver):
+    """SERP kesin konumla mı yüklendi? ('8,1 km içinde' / 'Bölge seç' satırı)"""
+    try:
+        return bool(driver.execute_script(
+            "const t=(document.body.innerText||'');"
+            "return /km içinde|Bölge seç|Choose area|mi\. radius/i.test(t);"))
+    except Exception:
+        return False
+
+
+def konum_kesin_kullan(driver, log_cb=None, tur=3):
+    """SERP'teki 'Tam konumu kullan' düğmesine bas -> kesin konumla yenilensin.
+
+    Google mobil SERP'te reklamların çoğu SADECE kesin konumla geliyor:
+      IP konumu ('Avrupa Yakası')             -> 0 reklam
+      kesin konum ('Bağcılar', 8,1 km içinde) -> reklam var
+    Düğme iki yerde çıkar: sonuç üstündeki çip ve 'Konumunuza daha yakın
+    sonuçları görmek ister misiniz?' penceresi. İkisi de aynı metni taşır.
+    Chrome'un kendi izin penceresi CDP ile baştan onaylandığı için çıkmaz.
+
+    Döner: True -> tıklandı (sayfa yenilenecek), False -> gerek yok/bulunamadı.
+    """
+    if _konum_kesin_mi(driver):
+        return False
+    metinler = ("Tam konumu kullan", "Kesin konumu kullan", "Use precise location")
+    tikladi = False
+    for _ in range(tur):
+        bulundu = False
+        for m in metinler:
+            try:
+                ogeler = driver.find_elements(
+                    By.XPATH,
+                    f"//*[normalize-space(text())='{m}']"
+                    f" | //*[@aria-label='{m}']")
+            except Exception:
+                ogeler = []
+            for el in ogeler:
+                try:
+                    if not el.is_displayed():
+                        continue
+                    try:
+                        el.click()
+                    except Exception:
+                        driver.execute_script("arguments[0].click();", el)
+                    tikladi = bulundu = True
+                    break
+                except Exception:
+                    continue
+            if bulundu:
+                break
+        if not bulundu:
+            break
+        insanca_bekle(1.0, 1.8)
+        if _konum_kesin_mi(driver):
+            break
+    if tikladi:
+        _log(log_cb, "  Kesin konum kullanıldı (yerel reklamlar için).")
+    else:
+        _log(log_cb, "  ! 'Tam konumu kullan' bulunamadı - konum IP'den "
+                     "geliyor, reklam çıkmayabilir.")
+    return tikladi
+
+
+def konum_penceresi_isle(driver, log_cb=None):
+    """Konum penceresi çıktıysa: ÖNCE 'Tam konumu kullan' (reklam için gerekli),
+    bulunamazsa sayfayı bloklamasın diye reddederek kapat."""
+    if konum_kesin_kullan(driver, log_cb, tur=1):
+        return True
+    return konum_popup_kapat(driver)
+
+
 def sonuc_bekle(driver, sn=20):
     """Sonuç sayfasını bekle: #search VEYA #rso VEYA h3 linkleri."""
     return WebDriverWait(driver, sn).until(
@@ -1804,7 +1875,7 @@ def _reklam_haritasi(driver, log_cb=None, arama="", etiket="Tarama"):
     Döner: [(domain, href)] DOM sırasıyla (üstten alta), domain başına ilk link.
     Bulunan domainler DB'ye de yazılır (girilsin girilmesin).
     """
-    konum_popup_kapat(driver)
+    konum_penceresi_isle(driver, log_cb)
     _reklam_bekle(driver, 10, log_cb)     # ust reklamlar dolsun (mobil veride gec)
     _tum_sayfayi_kaydir(driver)
     reklamlar = []
@@ -1911,7 +1982,7 @@ def _reklamlari_sirayla_isle(driver, domainler, log_cb, serp_url, iptal_mi,
 
 def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
             sadece_reklam=False, log_cb=None, dur_kontrol=None, mobil=False,
-            gercek_telefon=False, cihaz_seri=None):
+            gercek_telefon=False, cihaz_seri=None, konum_kord=None):
     """
     Tek bir arama çalıştır.
       arama         : aranacak kelime (str)
@@ -1927,6 +1998,9 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
       gercek_telefon: True ise ADB ile bağlı GERÇEK Android telefondaki Chrome'u sürer
                       (androidPackage). Gerçek mobil fingerprint + IP. uc/emülasyon kullanılmaz.
       cihaz_seri    : gercek_telefon için hedef cihaz serisi (birden çok cihaz varsa)
+      konum_kord    : (enlem, boylam) verilirse tarayıcıya bu konum enjekte edilir.
+                      PC'de GPS olmadığı için gerekir; gerçek telefonda boş
+                      bırakılırsa cihazın kendi GPS'i kullanılır.
     """
 
     def iptal_mi():
@@ -2101,16 +2175,33 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
     else:
         _stealth_uygula(driver, mobil=mobil)
 
-    # Konum iznini CDP ile REDDET (popup hiç çıkmasın). Her modda denenir.
+    # Konum iznini CDP ile VER (Chrome'un kendi izin penceresi hiç çıkmasın).
+    # KRİTİK: reklamların çoğu SADECE kesin konumla geliyor. Ölçüm (aynı
+    # telefon, aynı dakika, 'tufan tesisat'):
+    #   IP konumu ('Avrupa Yakası')            -> 0 reklam
+    #   kesin konum ('Bağcılar', 8,1 km içinde) -> reklam VAR
+    # Eskiden burada izin REDDEDİLİYORDU -> bot hiç reklam bulamıyordu.
     for _kok in ("https://www.google.com", "https://www.google.com.tr"):
         try:
             driver.execute_cdp_cmd("Browser.setPermission", {
                 "origin": _kok,
                 "permission": {"name": "geolocation"},
-                "setting": "denied",
+                "setting": "granted",
             })
         except Exception:
             pass
+    # PC'de GPS yok -> koordinat verilmişse CDP ile enjekte et.
+    # (Gerçek telefonda cihazın kendi GPS'i kullanılır.)
+    if konum_kord:
+        try:
+            driver.execute_cdp_cmd("Emulation.setGeolocationOverride", {
+                "latitude": float(konum_kord[0]),
+                "longitude": float(konum_kord[1]),
+                "accuracy": 30,
+            })
+            _log(log_cb, f"  Konum ayarlandı: {konum_kord[0]}, {konum_kord[1]}")
+        except Exception as _ex:
+            _log(log_cb, f"  Konum ayarlanamadı: {str(_ex)[:60]}")
 
     try:
         # ARAMA: ana sayfa + kutuya ELLE yazma (insan davranışı korunur).
@@ -2186,9 +2277,11 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
             _log(log_cb, f"  .com.tr'ye alma uyarısı: {str(_ex)[:60]}")
 
         insanca_bekle()
-        # konum/izin popup'ı çıktıysa reddederek kapat (sayfayı bloklamasın)
-        if konum_popup_kapat(driver):
-            _log(log_cb, "  Konum izni penceresi kapatıldı.")
+        # KESİN KONUM: 'Tam konumu kullan' -> SERP yeniden yüklenir ve
+        # yerel reklamlar gelir. Reddedilirse reklam hiç çıkmıyor.
+        if konum_kesin_kullan(driver, log_cb):
+            sonuc_bekle(driver, 20)
+            insanca_bekle()
         serp_url = driver.current_url   # sonuç sayfasına kesin dönmek için
         mouse_gezin(driver, dongu=1)
 
@@ -2226,7 +2319,7 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
             # --- Hedef site(ler): SERP'teki gerçek sonuca TIKLA ---
             # Her domaini SERP'te taze bul, tıkla, gez, SERP'e dön, sıradakine geç.
             mouse_gezin(driver, dongu=1)
-            konum_popup_kapat(driver)     # geç çıkan konum penceresini kapat
+            konum_penceresi_isle(driver, log_cb)   # geç çıkan konum penceresi
             _tum_sayfayi_kaydir(driver)   # tüm sonuç + alt reklamlar yüklensin
             # SERP'teki reklam domainlerini logla + DB'ye kaydet
             _reklam_domainleri_topla(driver, log_cb, arama)
@@ -2631,7 +2724,21 @@ def telefon_hazirla(adb_yol=None, seri=None, mobil_veri=True, log_cb=None):
         _adb_swipe(w // 2, int(h * 0.80), w // 2, int(h * 0.20), 250, adb_yol, seri)
         # sürüş boyunca ekran uyumasın
         _adb(adb_yol, "shell", "svc", "power", "stayon", "true", seri=seri, sn=8)
-        _log(log_cb, "Telefon hazır (uyanık, kilit açık).")
+        # KONUM: kapalıysa Google kesin konum veremez -> reklamlar gelmiyor.
+        # (Ölçüm: IP konumu 0 reklam, kesin konum reklam var.)
+        try:
+            mod = (_adb(adb_yol, "shell", "settings", "get", "secure",
+                        "location_mode", seri=seri, sn=8) or "").strip()
+            if mod in ("0", "null", ""):
+                _adb(adb_yol, "shell", "settings", "put", "secure",
+                     "location_mode", "3", seri=seri, sn=8)
+                _log(log_cb, "  Telefonda konum servisi açıldı (reklamlar için).")
+            for op in ("android:fine_location", "android:coarse_location"):
+                _adb(adb_yol, "shell", "cmd", "appops", "set",
+                     "com.android.chrome", op, "allow", seri=seri, sn=8)
+        except Exception as ex:
+            _log(log_cb, f"  Konum ayarı uyarısı: {str(ex)[:60]}")
+        _log(log_cb, "Telefon hazır (uyanık, kilit açık, konum açık).")
     except Exception as ex:
         _log(log_cb, f"Telefon hazırlama uyarısı: {str(ex)[:60]}")
 
