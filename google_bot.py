@@ -2113,29 +2113,32 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
             pass
 
     try:
-        # ARAMA: DOĞRUDAN .com.tr sonuç sayfası açılır.
+        # ARAMA: ana sayfa + kutuya ELLE yazma (insan davranışı korunur).
         # NOT: '/ncr' (No Country Redirect) KULLANILMAZ; Google'ı global/ABD
         # google.com'a sabitliyordu.
-        # Ana sayfaya girip kutuya yazmak da BIRAKILDI: form araması Google'ı
-        # www.google.com'a düşürüyordu (URL'de source=hp) ve .com SERP'i TR
-        # reklamlarını açık artırmaya SOKMUYOR -> #tads slotları ayrılır ama
-        # hiç dolmaz. Aynı cihaz/IP/sorguda ölçüm:
-        #   ana sayfa+yaz+Enter -> .com  -> 0 reklam
-        #   doğrudan /search    -> .com.tr -> 3-7 reklam
-        import urllib.parse as _up
-        arama_url = ("https://www.google.com.tr/search?q="
-                     + _up.quote_plus(arama) + "&hl=tr&gl=tr")
+        # Form araması Google'ı sık sık www.google.com'a düşürüyor
+        # (URL'de source=hp) ve .com SERP'i TR reklamlarını açık artırmaya
+        # SOKMUYOR -> #tads slotları ayrılır ama hiç dolmaz. Bu yüzden
+        # aşağıda sonuç .com'a düştüyse aynı sorgu .com.tr'de yeniden açılır.
         # internet yoksa (uçak modu yeni kapandıysa) bekle-tekrar dene
-        _ag_bekle_ve_ac(driver, arama_url, log_cb, iptal_mi)
+        _ag_bekle_ve_ac(driver, GOOGLE_URL, log_cb, iptal_mi)
         if iptal_mi():
             return
         # sayfa yükü sonrası KISA sabit bekleme (insanca_bekle'nin uzun kuyruğu yok)
         time.sleep(random.uniform(0.3, 0.7))
-        if cerez_kapat(driver):        # çerez onayı çıktıysa sayfa yenilenir
-            time.sleep(random.uniform(0.4, 0.9))
+        cerez_kapat(driver)
         if iptal_mi():
             return
-        _log(log_cb, f"Arama açıldı ({arama}), sonuçlar bekleniyor...")
+
+        kutu = WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.NAME, "q"))
+        )
+        kutu.click()
+        time.sleep(random.uniform(0.2, 0.5))
+        _insanca_yaz(kutu, arama)
+        time.sleep(random.uniform(0.25, 0.6))   # yazım sonrası kısa, sonra ara
+        kutu.send_keys(Keys.RETURN)
+        _log(log_cb, "Arama yapıldı, sonuçlar bekleniyor...")
 
         try:
             sonuc_bekle(driver, 20)
@@ -2164,8 +2167,8 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
                 _log(log_cb, f"Sonuç gelmedi. URL: {url}")
                 raise
 
-        # --- GÜVENLİK AĞI: sonuç yine de .com'a mı düştü? ---
-        # Doğrudan .com.tr/search açıyoruz ama Google bazen .com'a
+        # --- KRİTİK: sonuç .com'a mı düştü? ---
+        # Kutuya yazıp Enter'lamak Google'ı çoğu kez www.google.com'a
         # yönlendiriyor. .com SERP'i TR reklamlarını açık artırmaya SOKMUYOR:
         # sayfa normal gelir, #tads slotları ayrılır ama HİÇ dolmaz.
         # Ölçüm: .com -> 0 reklam, .com.tr/search -> 3-7 reklam (aynı cihaz/IP).
