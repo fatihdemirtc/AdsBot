@@ -2113,28 +2113,29 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
             pass
 
     try:
+        # ARAMA: DOĞRUDAN .com.tr sonuç sayfası açılır.
+        # NOT: '/ncr' (No Country Redirect) KULLANILMAZ; Google'ı global/ABD
+        # google.com'a sabitliyordu.
+        # Ana sayfaya girip kutuya yazmak da BIRAKILDI: form araması Google'ı
+        # www.google.com'a düşürüyordu (URL'de source=hp) ve .com SERP'i TR
+        # reklamlarını açık artırmaya SOKMUYOR -> #tads slotları ayrılır ama
+        # hiç dolmaz. Aynı cihaz/IP/sorguda ölçüm:
+        #   ana sayfa+yaz+Enter -> .com  -> 0 reklam
+        #   doğrudan /search    -> .com.tr -> 3-7 reklam
+        import urllib.parse as _up
+        arama_url = ("https://www.google.com.tr/search?q="
+                     + _up.quote_plus(arama) + "&hl=tr&gl=tr")
         # internet yoksa (uçak modu yeni kapandıysa) bekle-tekrar dene
-        # NOT: '/ncr' (No Country Redirect) KULLANILMAZ. Google'ı global/ABD
-        # google.com'a sabitliyordu -> arayüz İngilizce + TR yerel reklamlar
-        # açık artırmaya girmiyordu. Doğrudan .com.tr + hl/gl=tr açılır.
-        _ag_bekle_ve_ac(driver, GOOGLE_URL, log_cb, iptal_mi)
+        _ag_bekle_ve_ac(driver, arama_url, log_cb, iptal_mi)
         if iptal_mi():
             return
         # sayfa yükü sonrası KISA sabit bekleme (insanca_bekle'nin uzun kuyruğu yok)
         time.sleep(random.uniform(0.3, 0.7))
-        cerez_kapat(driver)
+        if cerez_kapat(driver):        # çerez onayı çıktıysa sayfa yenilenir
+            time.sleep(random.uniform(0.4, 0.9))
         if iptal_mi():
             return
-
-        kutu = WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.NAME, "q"))
-        )
-        kutu.click()
-        time.sleep(random.uniform(0.2, 0.5))
-        _insanca_yaz(kutu, arama)
-        time.sleep(random.uniform(0.25, 0.6))   # yazım sonrası kısa, sonra ara
-        kutu.send_keys(Keys.RETURN)
-        _log(log_cb, "Arama yapıldı, sonuçlar bekleniyor...")
+        _log(log_cb, f"Arama açıldı ({arama}), sonuçlar bekleniyor...")
 
         try:
             sonuc_bekle(driver, 20)
@@ -2163,11 +2164,10 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
                 _log(log_cb, f"Sonuç gelmedi. URL: {url}")
                 raise
 
-        # --- KRİTİK: sonuç .com'da mı? ---
-        # Ana sayfadaki arama formu Google'ı sık sık www.google.com'a
-        # yönlendiriyor (URL'de source=hp). .com SERP'i TR reklamlarını
-        # açık artırmaya SOKMUYOR: sayfa normal gelir, #tads slotları
-        # ayrılır ama HİÇ dolmaz -> "reklam bulunamadı".
+        # --- GÜVENLİK AĞI: sonuç yine de .com'a mı düştü? ---
+        # Doğrudan .com.tr/search açıyoruz ama Google bazen .com'a
+        # yönlendiriyor. .com SERP'i TR reklamlarını açık artırmaya SOKMUYOR:
+        # sayfa normal gelir, #tads slotları ayrılır ama HİÇ dolmaz.
         # Ölçüm: .com -> 0 reklam, .com.tr/search -> 3-7 reklam (aynı cihaz/IP).
         try:
             if "google.com.tr" not in (driver.current_url or ""):
@@ -2557,8 +2557,11 @@ def _telefon_ag_teshis(adb_yol=None, seri=None, log_cb=None):
                        "private_dns_specifier", seri=seri, sn=8) or "").strip()
         ucak = (_adb(adb_yol, "shell", "settings", "get", "global",
                      "airplane_mode_on", seri=seri, sn=8) or "").strip()
-        vpn = (_adb(adb_yol, "shell", "ifconfig", "tun0", seri=seri, sn=8) or "")
-        vpn_var = "tun0" in vpn and "error" not in vpn.lower()
+        # VPN: arayuz listesinde tun0/ppp0 var mi. ('ifconfig tun0' KULLANILMAZ:
+        # cihaz yokken bile ciktida 'tun0' gecer -> yanlis VPN alarmi verdi.)
+        import re as _re
+        arayuz = (_adb(adb_yol, "shell", "ip", "-o", "link", seri=seri, sn=8) or "")
+        vpn_var = bool(_re.search(r"(tun|ppp)\d+:", arayuz))
         _log(log_cb, f"  TEŞHİS telefon: private_dns={mod or '?'}"
                      f"{'(' + sunucu + ')' if sunucu and sunucu != 'null' else ''}"
                      f", vpn={'VAR' if vpn_var else 'yok'}"
