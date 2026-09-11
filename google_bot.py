@@ -1218,6 +1218,22 @@ def _yazidan_host(metin):
     return t if ("." in t and " " not in t) else ""
 
 
+def _metinden_hostlar(metin):
+    """Serbest metinden domain benzeri sozcukleri sirayla cikar.
+
+    Mobil SERP'te reklamin gorunen adresi <cite> degil, sinifsiz bir <span>
+    icinde olabilir -> blok metninden 'site.com.tr' gibi parcalari yakala.
+    """
+    if not metin:
+        return []
+    kal = re.findall(
+        r"\b((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+"
+        r"(?:com|net|org|info|biz|co|tr|ist|online|site|xyz|shop|store|app|dev|tech))"
+        r"(?![a-z0-9-])",
+        (metin or "").lower())
+    return [_temiz_domain(k) for k in kal]
+
+
 def _domain_es(a, b):
     """İki domain eşleşiyor mu (alt alan adı iki yönlü)."""
     a, b = _temiz_domain(a or ""), _temiz_domain(b or "")
@@ -1243,6 +1259,11 @@ def _reklam_hedef_domain(bilgi):
         h = _yazidan_host(bilgi.get(alan) or "")
         if h and not _ag_hosti(h):
             return h
+    # son care: reklam blogunun gorunen metninde gecen ilk ag-disi domain
+    for alan in ("cite", "blok"):
+        for h in _metinden_hostlar(bilgi.get(alan) or ""):
+            if not _ag_hosti(h) and "." in h:
+                return h
     return ""
 
 
@@ -1276,17 +1297,22 @@ def _reklam_bilgileri(driver):
     const sponEtiket = (el) => {
       let p = el;
       for (let i = 0; i < 5 && p; i++, p = p.parentElement) {
-        const t = ((p.innerText || '').slice(0, 40)).toLowerCase();
-        if (/^sponsorlu|^sponsored|^reklam\b|·\s*sponsorlu|·\s*sponsored/.test(t)) return true;
+        const t = ((p.innerText || '').slice(0, 60)).toLowerCase();
+        // etiket blogun BASINDA olmayabilir ('site.com · Sponsorlu' / alt satir)
+        if (/sponsorlu|sponsored|\breklam\b/.test(t)) return true;
       }
       return false;
     };
+    // NOT: '/goto?url=' REKLAM IZI DEGIL -> mobil SERP'te ORGANIK linkler de
+    // bu yonlendirmeyi kullaniyor (sayfada ~50 goto, 1 reklam). Eklenirse tum
+    // organik sonuclar reklam sanilir.
     const hrefAd = (h) => /\/aclk|googleadservices|googlesyndication|\/pagead\/|adurl=/.test((h||'').toLowerCase());
     // hedef ipuçları: aclk href'i hedefi taşımayabilir
     const ipucu = (a) => {
-      let pcu = '', cite = '', dtld = '';
+      let pcu = '', cite = '', dtld = '', blok = '';
       let p = a;
-      for (let i = 0; i < 8 && p; i++, p = p.parentElement) {
+      // 12 seviye: mobil SERP'te baslik linki ile gorunen adres ayri dallarda
+      for (let i = 0; i < 12 && p; i++, p = p.parentElement) {
         if (!p.getAttribute) continue;
         if (!pcu)  pcu  = p.getAttribute('data-pcu') || p.getAttribute('data-rw') || '';
         if (!dtld) dtld = p.getAttribute('data-dtld') || p.getAttribute('data-hveid-url') || '';
@@ -1294,19 +1320,27 @@ def _reklam_bilgileri(driver):
           const c = p.querySelector('cite, [role="text"] cite, span[class*="cite"]');
           if (c) cite = (c.innerText || '').trim();
         }
+        // reklam kartinin metni: gorunen adres cite disinda olabilir
+        if (!blok) {
+          const t = (p.innerText || '').trim();
+          if (t.length > 12 && t.length < 400) blok = t;
+        }
         if (pcu && cite) break;
       }
-      return {pcu: pcu, cite: cite, dtld: dtld};
+      return {pcu: pcu, cite: cite, dtld: dtld, blok: blok};
     };
     document.querySelectorAll('a[href]').forEach(a => {
       const href = a.href || '';
       if (!href || seen.has(href)) return;
+      // reklam icindeki 'Telefon et' / mail eki: tiklanirsa cevirici acilir
+      if (/^(tel:|mailto:|sms:|javascript:)/i.test(href)) return;
       if (hrefAd(href) || reklamKonteyner(a) || sponEtiket(a)) {
         const r = a.getBoundingClientRect();
         if (a.offsetParent !== null || r.width > 0 || r.height > 0) {
           seen.add(href);
           const ip = ipucu(a);
-          out.push({el: a, href: href, pcu: ip.pcu, cite: ip.cite, dtld: ip.dtld});
+          out.push({el: a, href: href, pcu: ip.pcu, cite: ip.cite,
+                    dtld: ip.dtld, blok: ip.blok});
         }
       }
     });
@@ -1583,6 +1617,8 @@ def _reklam_domainleri_topla(driver, log_cb, arama=""):
     """SERP'teki TÜM reklam domainlerini çıkar, LOGLA ve DB'ye KAYDET."""
     bulunan = []
     try:
+        if not _reklam_bilgileri(driver):
+            _reklam_bekle(driver, 8, log_cb)   # reklam gec dolmus olabilir
         for b in _reklam_bilgileri(driver):
             rd = b.get("domain") or ""
             if rd and rd not in bulunan:
@@ -1594,6 +1630,7 @@ def _reklam_domainleri_topla(driver, log_cb, arama=""):
         reklam_domain_kaydet(bulunan, arama, log_cb)   # yerel DB'ye yaz
     else:
         _log(log_cb, "  Sayfada reklam linki bulunamadı.")
+        _serp_teshis(driver, log_cb, arama)
     return bulunan
 
 
@@ -1635,6 +1672,132 @@ def _mobil_emulasyon():
     }
 
 
+def _serp_teshis(driver, log_cb=None, arama=""):
+    """Reklam çıkmadığında NEDEN çıkmadığını anlamak için SERP'i incele.
+
+    Sayfa kaynağındaki ham reklam izlerini sayar (aclk / Sponsorlu / #tads).
+    - iz VAR ama tespit 0  -> DOM tespiti kaçırıyor (seçici sorunu)
+    - iz YOK               -> Google bu oturuma reklam SERVİS ETMİYOR
+      (bot/IVT filtresi, IP, konum, temiz profil, sorgu ticari değil)
+    Ayrıca SERP HTML + ekran görüntüsü masaüstüne kaydedilir.
+    """
+    try:
+        kaynak = driver.page_source or ""
+    except Exception:
+        return {}
+    dusuk = kaynak.lower()
+    sayac = {
+        "aclk": dusuk.count("/aclk"),
+        "adservices": dusuk.count("googleadservices"),
+        "sponsorlu": dusuk.count("sponsorlu") + dusuk.count(">sponsored"),
+        "data-text-ad": dusuk.count("data-text-ad"),
+        "data-pcu": dusuk.count("data-pcu"),
+        "tads": dusuk.count('id="tads"') + dusuk.count('id="tadsb"')
+                + dusuk.count('id="bottomads"'),
+    }
+    _log(log_cb, "  TEŞHİS ham iz: " +
+                 ", ".join(f"{k}={v}" for k, v in sayac.items()))
+    try:
+        ua = driver.execute_script("return navigator.userAgent") or ""
+        mobil_ua = "Mobile" in ua or "Android" in ua
+        _log(log_cb, f"  TEŞHİS ortam: url={driver.current_url[:110]}")
+        _log(log_cb, f"  TEŞHİS UA: {'MOBIL' if mobil_ua else 'MASAUSTU'} | {ua[:90]}")
+        gorunen = driver.execute_script(
+            "return (document.body.innerText||'').length") or 0
+        _log(log_cb, f"  TEŞHİS sayfa metni: {gorunen} karakter, "
+                     f"'sponsorlu' metinde: "
+                     + str(driver.execute_script(
+                           "return ((document.body.innerText||'')"
+                           ".toLowerCase().match(/sponsorlu|sponsored/g)||[]).length")))
+    except Exception:
+        pass
+    # 'aclk'/'googleadservices' Google'in kendi JS sablonlarinda da gecer ->
+    # tek basina reklam KANITI degil. Gercek kanit: Sponsorlu etiketi / ad DOM'u.
+    kanit = (sayac["sponsorlu"] + sayac["data-text-ad"] + sayac["data-pcu"]
+             + max(0, sayac["aclk"] - 2))
+    kabuk, dolu = _reklam_kabugu(driver)
+    _log(log_cb, f"  TEŞHİS reklam slotu: {kabuk} kabuk, {dolu} dolu")
+    if kanit <= 0 and kabuk > 0 and dolu == 0:
+        # Slot AYRILMIŞ ama içerik gelmemiş: açık artırma boş dönmüş ya da
+        # reklam isteği engellenmiş (Private DNS/VPN/adblok) ya da IVT filtresi.
+        _log(log_cb, f"  -> Reklam slotu ({kabuk}) AYRILMIŞ ama BOŞ kalmış: "
+                     "reklam içeriği hiç gelmedi. Seçici sorunu DEĞİL — "
+                     "reklam isteği boş döndü/engellendi (IVT filtresi, "
+                     "Private DNS/VPN/adblok, ya da o an teklif veren yok).")
+    elif kanit <= 0:
+        _log(log_cb, "  -> Sayfada HİÇ reklam izi yok: Google bu oturuma reklam "
+                     "vermiyor (IP/bot filtresi, konum veya sorgu). Tespit hatası değil.")
+    else:
+        _log(log_cb, "  -> Sayfada reklam izi VAR ama link çözülemedi: "
+                     "tespit/seçici sorunu.")
+    # Gerçek telefon: reklamı engelleyebilecek cihaz ayarlarını raporla
+    if getattr(driver, "_gercek", False):
+        _telefon_ag_teshis(getattr(driver, "_adb_yol", None),
+                           getattr(driver, "_adb_seri", None), log_cb)
+    try:
+        ad = "".join(c for c in (arama or "arama") if c.isalnum() or c in " -_")[:40]
+        damga = time.strftime("%Y%m%d-%H%M%S")
+        kok = os.path.join(MASAUSTU, f"serp-{ad}-{damga}")
+        with open(kok + ".html", "w", encoding="utf-8") as f:
+            f.write(kaynak)
+        try:
+            driver.save_screenshot(kok + ".png")
+        except Exception:
+            pass
+        _log(log_cb, f"  TEŞHİS dosyası: {kok}.html")
+    except Exception:
+        pass
+    return sayac
+
+
+def _reklam_kabugu(driver):
+    """Reklam konteyner 'kabuklarini' say: kac slot var, kaci DOLU.
+
+    Google mobil SERP'te #tads icinde slot div'leri sayfa govdesiyle gelir,
+    icerik SONRA doldurulur. kabuk>0 ve dolu=0 -> reklam gelmedi (secici sorunu
+    degil): reklam istegi bos dondu / engellendi / henuz yetismedi.
+    """
+    js = r"""
+    let kabuk = 0, dolu = 0;
+    document.querySelectorAll('#tads > div, #tadsb > div, #bottomads > div,'
+      + ' #tvcap > div > div').forEach(d => {
+      kabuk++;
+      const t = (d.innerText || '').trim();
+      if (t.length > 3 || d.querySelector('a[href]')) dolu++;
+    });
+    return {kabuk: kabuk, dolu: dolu};
+    """
+    try:
+        r = driver.execute_script(js) or {}
+        return int(r.get("kabuk") or 0), int(r.get("dolu") or 0)
+    except Exception:
+        return 0, 0
+
+
+def _reklam_bekle(driver, sn=10, log_cb=None):
+    """Reklamlar DOM'a gelene kadar bekle (mobil veride gec dolar).
+
+    Reklam bulunursa True. Hic kabuk yoksa erken cikar (beklemeye gerek yok).
+    """
+    bas = time.time()
+    bos_tur = 0
+    while time.time() - bas < sn:
+        if _reklam_bilgileri(driver):
+            gecen = time.time() - bas
+            if gecen > 1.0:
+                _log(log_cb, f"  Reklamlar {gecen:.1f} sn sonra doldu.")
+            return True
+        kabuk, dolu = _reklam_kabugu(driver)
+        if dolu:
+            return True
+        if kabuk == 0:
+            bos_tur += 1
+            if bos_tur >= 3:      # slot bile yok -> bu sorguya reklam yok
+                return False
+        time.sleep(0.7)
+    return bool(_reklam_bilgileri(driver))
+
+
 def _reklam_haritasi(driver, log_cb=None, arama="", etiket="Tarama"):
     """Sayfayı en alta kadar süz, TÜM reklamları (domain, href) olarak döndür.
 
@@ -1642,12 +1805,23 @@ def _reklam_haritasi(driver, log_cb=None, arama="", etiket="Tarama"):
     Bulunan domainler DB'ye de yazılır (girilsin girilmesin).
     """
     konum_popup_kapat(driver)
+    _reklam_bekle(driver, 10, log_cb)     # ust reklamlar dolsun (mobil veride gec)
     _tum_sayfayi_kaydir(driver)
     reklamlar = []
     gorulen = set()
     cozulemeyen = 0
     ornek = ""
-    for b in _reklam_bilgileri(driver):
+    bilgiler = _reklam_bilgileri(driver)
+    if not bilgiler:
+        # kaydirma sirasinda DOM yenilenmis / reklam gec gelmis olabilir:
+        # basa don, bir tur daha bekle, tekrar tara.
+        try:
+            driver.execute_script("window.scrollTo(0, 0);")
+        except Exception:
+            pass
+        if _reklam_bekle(driver, 6, log_cb):
+            bilgiler = _reklam_bilgileri(driver)
+    for b in bilgiler:
         href = b.get("href") or ""
         dom = b.get("domain") or ""
         if not dom:
@@ -1663,6 +1837,12 @@ def _reklam_haritasi(driver, log_cb=None, arama="", etiket="Tarama"):
     if cozulemeyen:
         _log(log_cb, f"  ! {cozulemeyen} reklam linkinin hedefi çözülemedi "
                      f"(örn: {ornek})")
+    if not reklamlar:
+        _serp_teshis(driver, log_cb, arama)
+    elif len(reklamlar) < 2:
+        kabuk, dolu = _reklam_kabugu(driver)
+        _log(log_cb, f"  (Sadece 1 reklam: slot {kabuk}, dolu {dolu}. "
+                     f"Üst blok #tads boşsa Google üst reklam servis etmiyor.)")
     return reklamlar
 
 
@@ -1784,7 +1964,7 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
         except Exception:
             pass
         # Chrome açılmadan önce telefonu hazırla: uyandır, kilit aç, mobil veri (operatör IP)
-        telefon_hazirla(_adb_yol, cihaz_seri, mobil_veri=True, log_cb=log_cb)
+        telefon_hazirla(_adb_yol, cihaz_seri, log_cb=log_cb)
         op = webdriver.ChromeOptions()
         op.add_experimental_option("androidPackage", "com.android.chrome")
         # Oturum/çerez KORUNMAZ: Chrome'u chromedriver başlatır ve açılışta
@@ -1982,6 +2162,25 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
                 driver.save_screenshot(os.path.join(MASAUSTU, "hata.png"))
                 _log(log_cb, f"Sonuç gelmedi. URL: {url}")
                 raise
+
+        # --- KRİTİK: sonuç .com'da mı? ---
+        # Ana sayfadaki arama formu Google'ı sık sık www.google.com'a
+        # yönlendiriyor (URL'de source=hp). .com SERP'i TR reklamlarını
+        # açık artırmaya SOKMUYOR: sayfa normal gelir, #tads slotları
+        # ayrılır ama HİÇ dolmaz -> "reklam bulunamadı".
+        # Ölçüm: .com -> 0 reklam, .com.tr/search -> 3-7 reklam (aynı cihaz/IP).
+        try:
+            if "google.com.tr" not in (driver.current_url or ""):
+                import urllib.parse as _up
+                _log(log_cb, "  Arama .com'a düştü -> .com.tr'ye alınıyor "
+                             "(TR reklamları için).")
+                _ag_bekle_ve_ac(driver,
+                                "https://www.google.com.tr/search?q="
+                                + _up.quote_plus(arama) + "&hl=tr&gl=tr",
+                                log_cb, iptal_mi)
+                sonuc_bekle(driver, 20)
+        except Exception as _ex:
+            _log(log_cb, f"  .com.tr'ye alma uyarısı: {str(_ex)[:60]}")
 
         insanca_bekle()
         # konum/izin popup'ı çıktıysa reddederek kapat (sayfayı bloklamasın)
@@ -2217,13 +2416,20 @@ def adb_cihazlar(adb_yol=None):
     adb_yol = adb_yol or adb_bul()
     cikti = _adb(adb_yol, "devices", "-l")
     liste = []
+    GECERLI = {"device", "unauthorized", "offline", "bootloader",
+               "recovery", "sideload", "authorizing", "no permissions"}
     for satir in cikti.splitlines()[1:]:
         satir = satir.strip()
         if not satir:
             continue
+        # 'adb: * daemon not running; starting now...' gibi bilgi satırlarını at
+        if satir.startswith("*") or satir.lower().startswith("adb"):
+            continue
         parcalar = satir.split()
+        if len(parcalar) < 2 or parcalar[1] not in GECERLI:
+            continue
         seri = parcalar[0]
-        durum = parcalar[1] if len(parcalar) > 1 else "?"
+        durum = parcalar[1]
         model = ""
         for p in parcalar[2:]:
             if p.startswith("model:"):
@@ -2337,6 +2543,33 @@ def _gercek_tikla(driver, hedef, onceki_handles, onceki_url):
         return False
 
 
+def _telefon_ag_teshis(adb_yol=None, seri=None, log_cb=None):
+    """Telefonda reklamı engelleyebilecek ayarları oku (Private DNS / VPN / veri tasarrufu).
+
+    Reklam gelmediğinde en sık sebepler: Private DNS (AdGuard/NextDNS vb.),
+    aktif VPN, Data Saver. Hepsi reklam isteğini düşürür ama SERP normal gelir.
+    """
+    adb_yol = adb_yol or adb_bul()
+    try:
+        mod = (_adb(adb_yol, "shell", "settings", "get", "global",
+                    "private_dns_mode", seri=seri, sn=8) or "").strip()
+        sunucu = (_adb(adb_yol, "shell", "settings", "get", "global",
+                       "private_dns_specifier", seri=seri, sn=8) or "").strip()
+        ucak = (_adb(adb_yol, "shell", "settings", "get", "global",
+                     "airplane_mode_on", seri=seri, sn=8) or "").strip()
+        vpn = (_adb(adb_yol, "shell", "ifconfig", "tun0", seri=seri, sn=8) or "")
+        vpn_var = "tun0" in vpn and "error" not in vpn.lower()
+        _log(log_cb, f"  TEŞHİS telefon: private_dns={mod or '?'}"
+                     f"{'(' + sunucu + ')' if sunucu and sunucu != 'null' else ''}"
+                     f", vpn={'VAR' if vpn_var else 'yok'}"
+                     f", uçak modu={'AÇIK' if ucak == '1' else 'kapalı'}")
+        if mod.startswith("hostname") or vpn_var:
+            _log(log_cb, "  ! Telefonda Private DNS/VPN aktif: reklam istekleri "
+                         "engelleniyor olabilir. Kapatıp tekrar dene.")
+    except Exception as ex:
+        _log(log_cb, f"  TEŞHİS telefon okunamadı: {str(ex)[:60]}")
+
+
 def _telefon_chrome_durdur(adb_yol=None, seri=None, log_cb=None, bekle=2):
     """Telefondaki Chrome sürecini düşür (force-stop).
 
@@ -2376,10 +2609,12 @@ def _telefon_sekmeleri_kapat(driver, log_cb=None):
 
 
 def telefon_hazirla(adb_yol=None, seri=None, mobil_veri=True, log_cb=None):
-    """Gerçek telefonu sürüşe hazırla: uyandır, kilidi aç, uyanık tut, mobil veriye geç.
+    """Gerçek telefonu sürüşe hazırla: uyandır, kilidi aç, uyanık tut.
 
-    mobil_veri=True: Wi-Fi kapat + hücresel veri aç -> operatör (gerçek mobil) IP'si.
-      NOT: ADB USB üzerinden olmalı. Kablosuz ADB'de Wi-Fi kapanınca bağlantı düşer.
+    AĞA DOKUNULMAZ. Wi-Fi / mobil veri anahtarları telefonda kullanıcı nasıl
+    bıraktıysa öyle kalır ('svc data disable' kalıcı bir ayardır; uçak modundan
+    sonra da kapalı kalıp telefonu internetsiz bırakıyordu).
+    IP yenileme SADECE uçak modu aç-kapa ile yapılır (tur sonunda).
     """
     adb_yol = adb_yol or adb_bul()
     try:
@@ -2390,13 +2625,25 @@ def telefon_hazirla(adb_yol=None, seri=None, mobil_veri=True, log_cb=None):
         _adb_swipe(w // 2, int(h * 0.80), w // 2, int(h * 0.20), 250, adb_yol, seri)
         # sürüş boyunca ekran uyumasın
         _adb(adb_yol, "shell", "svc", "power", "stayon", "true", seri=seri, sn=8)
-        if mobil_veri:
-            _adb(adb_yol, "shell", "svc", "wifi", "disable", seri=seri, sn=8)
-            _adb(adb_yol, "shell", "svc", "data", "enable", seri=seri, sn=8)
-        _log(log_cb, "Telefon hazır (uyanık, kilit açık"
-                     + (", mobil veri/operatör IP" if mobil_veri else "") + ").")
+        _log(log_cb, "Telefon hazır (uyanık, kilit açık).")
     except Exception as ex:
         _log(log_cb, f"Telefon hazırlama uyarısı: {str(ex)[:60]}")
+
+
+def telefon_normale_don(adb_yol=None, seri=None, log_cb=None):
+    """Sürüş bitince telefonu kullanılabilir bırak: uçak modu KAPALI,
+    ekran uyanık-kalma kapalı. Wi-Fi / mobil veri anahtarlarına dokunulmaz."""
+    adb_yol = adb_yol or adb_bul()
+    try:
+        _adb(adb_yol, "shell", "cmd", "connectivity", "airplane-mode", "disable",
+             seri=seri, sn=8)
+    except Exception:
+        pass
+    try:
+        _adb(adb_yol, "shell", "svc", "power", "stayon", "false", seri=seri, sn=8)
+    except Exception:
+        pass
+    _log(log_cb, "Telefon normale döndürüldü (uçak modu kapalı).")
 
 
 def ucak_modu(ac=True, adb_yol=None, seri=None, log_cb=None):

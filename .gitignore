@@ -23,3 +23,7 @@ selenium_chrome_*/
 
 # Yerel veritabanı (bulunan reklam siteleri - gizli)
 reklam_domainleri.db
+
+# SERP teşhis dökümleri
+serp-*.html
+serp-*.png

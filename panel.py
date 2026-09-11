@@ -437,6 +437,8 @@ class Panel:
                  font=("Segoe UI", 9)).pack(side="left")
         HoverButton(ust, PANEL2, KENAR, text="⟳",
                     command=self.cihaz_yenile).pack(side="right")
+        HoverButton(ust, PANEL2, KENAR, text="Uçak modu kapat",
+                    command=self.telefonu_duzelt).pack(side="right", padx=(0, 6))
         self.cihaz = tk.StringVar(value="(otomatik)")
         self.cihaz_cb = ttk.Combobox(df, textvariable=self.cihaz, state="readonly",
                                      font=("Segoe UI", 9), values=["(otomatik)"])
@@ -895,6 +897,15 @@ class Panel:
         self.ip_yenile()
 
     def _bitti(self):
+        # Telefonu kullanılabilir bırak: uçak modu kapalı, mobil veri + Wi-Fi açık.
+        # (Aksi halde 'svc data disable' / uçak modu kalıcı kalıp telefon
+        #  internete çıkamıyordu.)
+        if self.gercek_telefon.get():
+            try:
+                google_bot.telefon_normale_don(seri=self._secili_seri(),
+                                               log_cb=self.yaz)
+            except Exception as ex:
+                self.yaz(f"Telefon geri alma uyarısı: {str(ex)[:70]}")
         self.calisiyor = False
         self.baslat_btn.config(state="normal")
         self.dur_btn.config(state="disabled")
@@ -907,8 +918,21 @@ class Panel:
 
     def kapat(self):
         self.dur_bayrak = True
+        if self.gercek_telefon.get():
+            try:
+                google_bot.telefon_normale_don(seri=self._secili_seri())
+            except Exception:
+                pass
         self._kaydet()
         self.kok.destroy()
+
+    def telefonu_duzelt(self):
+        """Elle kurtarma: uçak modunu kapat (takılı kaldıysa)."""
+        try:
+            google_bot.telefon_normale_don(seri=self._secili_seri(),
+                                           log_cb=self.yaz)
+        except Exception as ex:
+            self.yaz(f"Telefon düzeltme HATA: {ex}", "hata")
 
 
 if __name__ == "__main__":
