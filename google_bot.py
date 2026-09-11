@@ -8,6 +8,8 @@ GUI:   run_bot(...) fonksiyonunu panel.py kullanır.
 
 import os
 import re
+import math
+import json
 import sys
 import time
 import random
@@ -1037,73 +1039,160 @@ def konum_popup_kapat(driver):
     return False
 
 
+# ---------------- Konum turu (İstanbul ilçeleri + kaydırma) ----------------
+# Google aynı koordinattan gelen aramaları kalıp olarak görüyor. Her arama
+# FARKLI bir ilçe merkezinden ve o merkezin etrafında RASTGELE bir noktadan
+# yapılır: ilçeler karıştırılmış sırayla gezilir (hepsi bitmeden tekrar yok),
+# ilçe içinde 0.5-10 km rastgele kayma uygulanır.
+ISTANBUL_ILCE = {
+    "Adalar": (40.8760, 29.0900),        "Arnavutköy": (41.1840, 28.7400),
+    "Ataşehir": (40.9840, 29.1270),      "Avcılar": (40.9800, 28.7210),
+    "Bağcılar": (41.0391, 28.8570),      "Bahçelievler": (41.0000, 28.8590),
+    "Bakırköy": (40.9800, 28.8720),      "Başakşehir": (41.0930, 28.8020),
+    "Bayrampaşa": (41.0470, 28.9120),    "Beşiktaş": (41.0430, 29.0090),
+    "Beykoz": (41.1350, 29.0960),        "Beylikdüzü": (40.9820, 28.6410),
+    "Beyoğlu": (41.0360, 28.9770),       "Büyükçekmece": (41.0200, 28.5750),
+    "Çatalca": (41.1430, 28.4610),       "Çekmeköy": (41.0390, 29.1790),
+    "Esenler": (41.0430, 28.8760),       "Esenyurt": (41.0290, 28.6800),
+    "Eyüpsultan": (41.0480, 28.9340),    "Fatih": (41.0160, 28.9400),
+    "Gaziosmanpaşa": (41.0580, 28.9120), "Güngören": (41.0200, 28.8710),
+    "Kadıköy": (40.9900, 29.0300),       "Kağıthane": (41.0850, 28.9720),
+    "Kartal": (40.8880, 29.1900),        "Küçükçekmece": (41.0000, 28.7800),
+    "Maltepe": (40.9350, 29.1560),       "Pendik": (40.8770, 29.2540),
+    "Sancaktepe": (41.0000, 29.2310),    "Sarıyer": (41.1670, 29.0570),
+    "Silivri": (41.0730, 28.2460),       "Sultanbeyli": (40.9670, 29.2670),
+    "Sultangazi": (41.1060, 28.8670),    "Şile": (41.1750, 29.6130),
+    "Şişli": (41.0600, 28.9870),         "Tuzla": (40.8160, 29.3000),
+    "Ümraniye": (41.0160, 29.1210),      "Üsküdar": (41.0230, 29.0150),
+    "Zeytinburnu": (40.9940, 28.9020),
+}
+
+KONUM_DURUM_YOL = os.path.join(_temel_klasor(), "konum_durum.json")
+
+
+def _kord_kaydir(enlem, boylam, km_min=0.5, km_maks=10.0):
+    """Noktayı rastgele yön + mesafeyle kaydır (halka içinde homojen)."""
+    aci = random.uniform(0, 2 * math.pi)
+    # sqrt: merkeze yığılmasın
+    r = math.sqrt(random.uniform((km_min / km_maks) ** 2, 1.0)) * km_maks
+    d_enlem = (r * math.cos(aci)) / 111.32
+    d_boylam = (r * math.sin(aci)) / (111.32 * math.cos(math.radians(enlem)) or 1)
+    return (round(enlem + d_enlem, 6), round(boylam + d_boylam, 6))
+
+
+def _konum_durum_oku():
+    try:
+        with open(KONUM_DURUM_YOL, "r", encoding="utf-8") as f:
+            d = json.load(f) or {}
+        if isinstance(d.get("sira"), list) and d["sira"]:
+            return d
+    except Exception:
+        pass
+    return {}
+
+
+def _konum_durum_yaz(durum):
+    try:
+        with open(KONUM_DURUM_YOL, "w", encoding="utf-8") as f:
+            json.dump(durum, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def sonraki_konum(taban=None, km_min=0.5, km_maks=10.0, log_cb=None):
+    """Bu arama için (enlem, boylam) üret.
+
+    taban verilirse: o noktanın etrafında rastgele kayma.
+    verilmezse    : İstanbul ilçeleri karıştırılmış sırayla gezilir; her
+                    ilçede merkezden km_min-km_maks arası rastgele nokta.
+    Sıra diske yazılır -> program kapansa da kaldığı yerden devam eder.
+    """
+    if taban:
+        e, b = _kord_kaydir(float(taban[0]), float(taban[1]), km_min, km_maks)
+        _log(log_cb, f"  Konum: taban ({taban[0]}, {taban[1]}) -> {e}, {b}")
+        return (e, b)
+    durum = _konum_durum_oku()
+    sira = [x for x in durum.get("sira", []) if x in ISTANBUL_ILCE]
+    i = int(durum.get("i", 0))
+    if not sira or i >= len(sira):
+        sira = list(ISTANBUL_ILCE)
+        random.shuffle(sira)
+        i = 0
+    ilce = sira[i]
+    _konum_durum_yaz({"sira": sira, "i": i + 1})
+    e, b = _kord_kaydir(*ISTANBUL_ILCE[ilce], km_min=km_min, km_maks=km_maks)
+    _log(log_cb, f"  Konum: {ilce} ({i + 1}/{len(sira)}) -> {e}, {b}")
+    return (e, b)
+
+
 def _konum_kesin_mi(driver):
     """SERP kesin konumla mı yüklendi? ('8,1 km içinde' / 'Bölge seç' satırı)"""
     try:
+        js = ("var t=(document.body.innerText||'').toLowerCase();"
+              "var k=arguments[0];"
+              "for (var i=0;i<k.length;i++){ if (t.indexOf(k[i])>=0) return true; }"
+              "return false;")
         return bool(driver.execute_script(
-            "const t=(document.body.innerText||'');"
-            "return /km içinde|Bölge seç|Choose area|mi\. radius/i.test(t);"))
+            js, ["km içinde", "bölge seç", "choose area"]))
     except Exception:
         return False
 
 
-def konum_kesin_kullan(driver, log_cb=None, tur=3):
-    """SERP'teki 'Tam konumu kullan' düğmesine bas -> kesin konumla yenilensin.
+def konum_kesin_kullan(driver, log_cb=None, sn=14, tur=3):
+    """SERP'te 'Tam konumu kullan'a bas -> sayfa KESIN konumla yenilensin.
 
-    Google mobil SERP'te reklamların çoğu SADECE kesin konumla geliyor:
+    Reklamların çoğu SADECE kesin konumla geliyor:
       IP konumu ('Avrupa Yakası')             -> 0 reklam
       kesin konum ('Bağcılar', 8,1 km içinde) -> reklam var
-    Düğme iki yerde çıkar: sonuç üstündeki çip ve 'Konumunuza daha yakın
-    sonuçları görmek ister misiniz?' penceresi. İkisi de aynı metni taşır.
-    Chrome'un kendi izin penceresi CDP ile baştan onaylandığı için çıkmaz.
 
-    Döner: True -> tıklandı (sayfa yenilenecek), False -> gerek yok/bulunamadı.
+    Düğme iki yerde çıkar (sonuç üstündeki çip ve 'Konumunuza daha yakın
+    sonuçlar' penceresi) ve GEÇ render oluyor -> sn saniye boyunca beklenir.
+    Tıklama JS ile yapılır: mobil SERP'te metin bir span'in içinde, Selenium
+    click'i öğeyi 'görünmez' sayıp atlayabiliyor.
+    Chrome'un kendi izin penceresi CDP ile baştan onaylandığı için çıkmaz.
     """
-    if _konum_kesin_mi(driver):
-        return False
-    metinler = ("Tam konumu kullan", "Kesin konumu kullan", "Use precise location")
+    metinler = ["tam konumu kullan", "kesin konumu kullan",
+                "use precise location", "tam konum"]
+    js = ("var m=arguments[0];"
+          "var all=document.querySelectorAll("
+          "  'a,button,span,div,[role=\"button\"],[role=\"link\"],g-raised-button');"
+          "for (var i=0;i<all.length;i++){"
+          "  var e=all[i];"
+          "  if (e.children.length>2) continue;"
+          "  var t=(e.innerText||'').trim().toLowerCase();"
+          "  if (m.indexOf(t)<0) continue;"
+          "  if (!e.getClientRects().length) continue;"
+          "  e.click(); return t; }"
+          "return '';")
+    bitis = time.time() + sn
     tikladi = False
-    for _ in range(tur):
-        bulundu = False
-        for m in metinler:
-            try:
-                ogeler = driver.find_elements(
-                    By.XPATH,
-                    f"//*[normalize-space(text())='{m}']"
-                    f" | //*[@aria-label='{m}']")
-            except Exception:
-                ogeler = []
-            for el in ogeler:
-                try:
-                    if not el.is_displayed():
-                        continue
-                    try:
-                        el.click()
-                    except Exception:
-                        driver.execute_script("arguments[0].click();", el)
-                    tikladi = bulundu = True
-                    break
-                except Exception:
-                    continue
-            if bulundu:
-                break
-        if not bulundu:
-            break
-        insanca_bekle(1.0, 1.8)
+    while time.time() < bitis and tur > 0:
         if _konum_kesin_mi(driver):
-            break
+            if tikladi:
+                _log(log_cb, "  Kesin konum kullanıldı (yerel reklamlar için).")
+            return tikladi
+        try:
+            vurus = driver.execute_script(js, metinler) or ""
+        except Exception:
+            vurus = ""
+        if vurus:
+            tikladi = True
+            tur -= 1
+            insanca_bekle(1.2, 2.0)      # sayfa kesin konumla yenilenir
+        else:
+            time.sleep(0.8)              # düğme geç gelebilir
     if tikladi:
-        _log(log_cb, "  Kesin konum kullanıldı (yerel reklamlar için).")
+        _log(log_cb, "  Kesin konum tıklandı (sayfa yenilendi).")
     else:
-        _log(log_cb, "  ! 'Tam konumu kullan' bulunamadı - konum IP'den "
-                     "geliyor, reklam çıkmayabilir.")
+        _log(log_cb, "  ! 'Tam konumu kullan' çıkmadı - konum IP'den geliyor, "
+                     "reklam çıkmayabilir.")
     return tikladi
 
 
 def konum_penceresi_isle(driver, log_cb=None):
     """Konum penceresi çıktıysa: ÖNCE 'Tam konumu kullan' (reklam için gerekli),
     bulunamazsa sayfayı bloklamasın diye reddederek kapat."""
-    if konum_kesin_kullan(driver, log_cb, tur=1):
+    if konum_kesin_kullan(driver, log_cb, sn=4, tur=1):
         return True
     return konum_popup_kapat(driver)
 
@@ -1982,7 +2071,8 @@ def _reklamlari_sirayla_isle(driver, domainler, log_cb, serp_url, iptal_mi,
 
 def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
             sadece_reklam=False, log_cb=None, dur_kontrol=None, mobil=False,
-            gercek_telefon=False, cihaz_seri=None, konum_kord=None):
+            gercek_telefon=False, cihaz_seri=None, konum_kord=None,
+            konum_gez=True, konum_sapma=(0.5, 10.0)):
     """
     Tek bir arama çalıştır.
       arama         : aranacak kelime (str)
@@ -1998,9 +2088,11 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
       gercek_telefon: True ise ADB ile bağlı GERÇEK Android telefondaki Chrome'u sürer
                       (androidPackage). Gerçek mobil fingerprint + IP. uc/emülasyon kullanılmaz.
       cihaz_seri    : gercek_telefon için hedef cihaz serisi (birden çok cihaz varsa)
-      konum_kord    : (enlem, boylam) verilirse tarayıcıya bu konum enjekte edilir.
-                      PC'de GPS olmadığı için gerekir; gerçek telefonda boş
-                      bırakılırsa cihazın kendi GPS'i kullanılır.
+      konum_kord    : (enlem, boylam) taban konum. Verilirse her aramada bu
+                      noktanın etrafında rastgele kayma uygulanır.
+      konum_gez     : True ise taban yoksa İstanbul ilçeleri karıştırılmış
+                      sırayla gezilir (her arama başka ilçeden).
+      konum_sapma   : (min_km, maks_km) kaydırma aralığı.
     """
 
     def iptal_mi():
@@ -2190,16 +2282,19 @@ def run_bot(arama, hedef_site="", tiklama=3, detach=False, gorunmez=False,
             })
         except Exception:
             pass
-    # PC'de GPS yok -> koordinat verilmişse CDP ile enjekte et.
-    # (Gerçek telefonda cihazın kendi GPS'i kullanılır.)
-    if konum_kord:
+    # Konumu CDP ile ver. Gerçek telefonda da geçerli: cihazın GPS'i yerine
+    # bu koordinat okunuyor (doğrulandı: enjekte edilen nokta navigator.
+    # geolocation'dan aynen döndü). Her aramada koordinat KAYDIRILIR ->
+    # hep aynı noktadan arama yapan kalıp oluşmaz.
+    if konum_kord or konum_gez:
         try:
+            _kord = sonraki_konum(konum_kord, konum_sapma[0], konum_sapma[1],
+                                  log_cb)
             driver.execute_cdp_cmd("Emulation.setGeolocationOverride", {
-                "latitude": float(konum_kord[0]),
-                "longitude": float(konum_kord[1]),
-                "accuracy": 30,
+                "latitude": float(_kord[0]),
+                "longitude": float(_kord[1]),
+                "accuracy": random.randint(18, 120),   # sabit hassasiyet de iz
             })
-            _log(log_cb, f"  Konum ayarlandı: {konum_kord[0]}, {konum_kord[1]}")
         except Exception as _ex:
             _log(log_cb, f"  Konum ayarlanamadı: {str(_ex)[:60]}")
 

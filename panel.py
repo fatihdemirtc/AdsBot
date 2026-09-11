@@ -446,6 +446,9 @@ class Panel:
         self.sadece_secili = tk.BooleanVar(value=False)
         self._ayar_check(ic, "Sadece seçili satır", self.sadece_secili)
 
+        self.konum_gez = tk.BooleanVar(value=True)
+        self._ayar_check(ic, "Konum kaydır (İstanbul ilçe turu)", self.konum_gez)
+
         # Konum: reklamların çoğu SADECE kesin konumla geliyor.
         # Gerçek telefonda cihazın GPS'i kullanılır; PC'de GPS yok ->
         # buraya enlem,boylam yazılırsa tarayıcıya o konum verilir.
@@ -457,7 +460,8 @@ class Panel:
         tk.Entry(kf, textvariable=self.konum, bg=PANEL2, fg=METIN,
                  insertbackground=METIN, relief="flat",
                  font=("Segoe UI", 10)).pack(fill="x", ipady=4, pady=(2, 0))
-        tk.Label(kf, text="boş = telefonun kendi GPS'i (ör: 41.0390,28.8570)",
+        tk.Label(kf, text="boş = İstanbul ilçe turu; dolu = o nokta "
+                          "etrafında kayma (ör: 41.0390,28.8570)",
                  bg=PANEL, fg=SOLUK, font=("Segoe UI", 8)).pack(anchor="w")
 
         # ADB cihaz seçimi
@@ -829,6 +833,7 @@ class Panel:
         gercek_telefon = self.gercek_telefon.get()
         cihaz_seri = self._secili_seri()
         konum_kord = self._konum_kord()
+        konum_gez = self.konum_gez.get()
         tur = 0
         arama_sayaci = 0
         # kaç aramada bir uzun 'oturum molası' verilecek (bot-önleme)
@@ -855,6 +860,7 @@ class Panel:
                             gercek_telefon=gercek_telefon,
                             cihaz_seri=cihaz_seri,
                             konum_kord=konum_kord,
+                            konum_gez=konum_gez,
                         )
                     except Exception as ex:
                         self.yaz(f"HATA ({x['arama']}): {ex}", "hata")
